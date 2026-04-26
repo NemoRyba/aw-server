@@ -14,12 +14,14 @@ from flask import (
     jsonify,
     make_response,
     request,
+    session,
 )
 from flask_restx import Api, Resource, fields
 
 from . import logger
 from .api import ServerAPI
 from .exceptions import BadRequest, Unauthorized
+from .fleet_sync import FleetSyncConflict
 
 
 def host_header_check(f):
@@ -75,6 +77,7 @@ create_bucket = api.model(
         "client": fields.String(required=True),
         "type": fields.String(required=True),
         "hostname": fields.String(required=True),
+        "data": fields.Raw(required=False),
     },
 )
 
@@ -84,7 +87,7 @@ update_bucket = api.model(
         "client": fields.String(required=False),
         "type": fields.String(required=False),
         "hostname": fields.String(required=False),
-        "data": fields.String(required=False),
+        "data": fields.Raw(required=False),
     },
 )
 
@@ -97,6 +100,22 @@ query = api.model(
         "query": fields.List(
             fields.String, required=True, description="String list of query statements"
         ),
+    },
+)
+
+fleet_report = api.model(
+    "FleetReport",
+    {
+        "report": fields.String(required=True),
+        "filters": fields.Raw(required=False),
+    },
+)
+
+auth_login = api.model(
+    "AuthLogin",
+    {
+        "username": fields.String(required=True),
+        "password": fields.String(required=True),
     },
 )
 
@@ -122,6 +141,87 @@ class InfoResource(Resource):
     @copy_doc(ServerAPI.get_info)
     def get(self) -> Dict[str, Dict]:
         return current_app.api.get_info()
+
+
+def _auth_payload():
+    username, user = _current_auth_user()
+    if not username or not user:
+        return {"authenticated": False, "user": None}
+
+    return {
+        "authenticated": True,
+        "user": {
+            "username": username,
+            "is_admin": bool(user.get("is_admin", False)),
+        },
+    }
+
+
+def _current_auth_user():
+    username = session.get("aw_auth_user")
+    if not username:
+        return None, None
+
+    user = current_app.api.get_auth_user(username)
+    if not user:
+        session.pop("aw_auth_user", None)
+        return None, None
+
+    return username, user
+
+
+def _settings_user():
+    if current_app.api.testing:
+        return None
+    username, _user = _current_auth_user()
+    return username
+
+
+def _require_admin_user():
+    if current_app.api.testing:
+        return {"username": "testing", "is_admin": True}
+
+    username, user = _current_auth_user()
+    if not username or not user:
+        raise Unauthorized("AuthRequired", "Authentication required")
+
+    if not bool(user.get("is_admin", False)):
+        raise Unauthorized("AdminRequired", "Admin access required")
+
+    return {
+        "username": username,
+        "is_admin": True,
+    }
+
+
+@api.route("/0/auth/session")
+class AuthSessionResource(Resource):
+    def get(self):
+        return jsonify(_auth_payload())
+
+
+@api.route("/0/auth/login")
+class AuthLoginResource(Resource):
+    @api.expect(auth_login)
+    def post(self):
+        data = request.get_json() or {}
+        username = str(data.get("username") or "").strip()
+        password = str(data.get("password") or "")
+
+        user = current_app.api.authenticate_user(username, password)
+        if not user:
+            raise Unauthorized("InvalidCredentials", "Invalid username or password")
+
+        session["aw_auth_user"] = username
+        session.permanent = True
+        return jsonify(_auth_payload())
+
+
+@api.route("/0/auth/logout")
+class AuthLogoutResource(Resource):
+    def post(self):
+        session.pop("aw_auth_user", None)
+        return jsonify({"authenticated": False, "user": None})
 
 
 # BUCKETS
@@ -151,6 +251,7 @@ class BucketResource(Resource):
             event_type=data["type"],
             client=data["client"],
             hostname=data["hostname"],
+            data=data.get("data"),
         )
         if bucket_created:
             return {}, 200
@@ -163,10 +264,10 @@ class BucketResource(Resource):
         data = request.get_json()
         current_app.api.update_bucket(
             bucket_id,
-            event_type=data["type"],
-            client=data["client"],
-            hostname=data["hostname"],
-            data=data["data"],
+            event_type=data.get("type"),
+            client=data.get("client"),
+            hostname=data.get("hostname"),
+            data=data.get("data"),
         )
         return {}, 200
 
@@ -396,11 +497,131 @@ class LogResource(Resource):
 @api.route("/0/settings/<string:key>")
 class SettingsResource(Resource):
     def get(self, key: str):
-        data = current_app.api.get_setting(key)
+        data = current_app.api.get_setting(key, user=_settings_user())
         return jsonify(data)
 
     def post(self, key: str):
         if not key:
             raise BadRequest("MissingParameter", "Missing required parameter key")
-        data = current_app.api.set_setting(key, request.get_json())
+        data = current_app.api.set_setting(
+            key,
+            request.get_json(),
+            user=_settings_user(),
+        )
         return data
+
+
+@api.route("/0/admin/ui-config")
+class AdminUiConfigResource(Resource):
+    def get(self):
+        return jsonify(current_app.api.get_admin_ui_config())
+
+    def post(self):
+        _require_admin_user()
+        return jsonify(current_app.api.set_admin_ui_config(request.get_json() or {}))
+
+
+# FLEET
+
+
+def _fleet_range():
+    args = request.args
+    start = _parse_query_date(args["start"]) if "start" in args else None
+    end = _parse_query_date(args["end"]) if "end" in args else None
+    return start, end
+
+
+def _fleet_device_ids():
+    values = []
+    for key in ("device_id", "device_ids", "device_ids[]"):
+        values.extend(request.args.getlist(key))
+    device_ids = []
+    for value in values:
+        for part in str(value).split(","):
+            part = part.strip()
+            if part:
+                device_ids.append(part)
+    if not device_ids:
+        return None
+    unique = []
+    seen = set()
+    for device_id in device_ids:
+        if device_id in seen:
+            continue
+        seen.add(device_id)
+        unique.append(device_id)
+    return unique
+
+
+def _parse_query_date(value: str):
+    normalized = value.replace(" ", "+")
+    return iso8601.parse_date(normalized)
+
+
+@api.route("/0/fleet/live")
+class FleetLiveResource(Resource):
+    def get(self):
+        return jsonify(current_app.api.get_live_fleet_summary())
+
+
+@api.route("/0/fleet/users")
+class FleetUsersResource(Resource):
+    def get(self):
+        return jsonify(current_app.api.get_fleet_users())
+
+
+@api.route("/0/fleet/users/<string:username>")
+class FleetUserResource(Resource):
+    def get(self, username: str):
+        start, end = _fleet_range()
+        return jsonify(
+            current_app.api.get_fleet_user(
+                username,
+                start=start,
+                end=end,
+                device_ids=_fleet_device_ids(),
+            )
+        )
+
+
+@api.route("/0/fleet/devices")
+class FleetDevicesResource(Resource):
+    def get(self):
+        return jsonify(current_app.api.get_fleet_devices())
+
+
+@api.route("/0/fleet/devices/<string:device_id>")
+class FleetDeviceResource(Resource):
+    def get(self, device_id: str):
+        start, end = _fleet_range()
+        return jsonify(current_app.api.get_fleet_device(device_id, start=start, end=end))
+
+
+@api.route("/0/fleet/report")
+class FleetReportResource(Resource):
+    @api.expect(fleet_report)
+    def post(self):
+        try:
+            return jsonify(current_app.api.run_fleet_report(request.get_json()))
+        except ValueError as exc:
+            raise BadRequest("InvalidFleetReport", str(exc))
+
+
+@api.route("/0/fleet/sync/handshake")
+class FleetSyncHandshakeResource(Resource):
+    def post(self):
+        try:
+            return current_app.api.fleet_sync_handshake(request.get_json())
+        except ValueError as exc:
+            raise BadRequest("InvalidFleetSyncHandshake", str(exc))
+
+
+@api.route("/0/fleet/sync/batch")
+class FleetSyncBatchResource(Resource):
+    def post(self):
+        try:
+            return current_app.api.fleet_sync_batch(request.get_json())
+        except FleetSyncConflict as exc:
+            return exc.payload, 409
+        except ValueError as exc:
+            raise BadRequest("InvalidFleetSyncBatch", str(exc))

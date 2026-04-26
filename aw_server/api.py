@@ -21,6 +21,19 @@ from aw_transform import heartbeat_merge
 
 from .__about__ import __version__
 from .exceptions import NotFound
+from .fleet import (
+    get_bucket_identity,
+    group_buckets_by_device,
+    group_buckets_by_user,
+    run_report,
+    summarize_devices,
+    summarize_device,
+    summarize_live_state,
+    summarize_user,
+    summarize_users,
+)
+from .fleet_sync import sync_batch, sync_handshake
+from .fleet_sync_store import FleetSyncStore
 from .settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -52,6 +65,7 @@ class ServerAPI:
     def __init__(self, db, testing) -> None:
         self.db = db
         self.settings = Settings(testing)
+        self.sync_store = FleetSyncStore(testing=testing)
         self.testing = testing
         self.last_event = {}  # type: dict
 
@@ -183,7 +197,7 @@ class ServerAPI:
         """Update bucket metadata"""
         self.db.update_bucket(
             bucket_id,
-            type=event_type,
+            type_id=event_type,
             client=client,
             hostname=hostname,
             data=data,
@@ -357,11 +371,64 @@ class ServerAPI:
                 payload.append(json.loads(line))
         return payload, 200
 
-    def get_setting(self, key):
+    def get_session_secret(self):
+        return self.settings.get_session_secret()
+
+    def get_auth_user(self, username):
+        return self.settings.get_auth_user(username)
+
+    def authenticate_user(self, username, password):
+        return self.settings.authenticate_user(username, password)
+
+    def get_admin_ui_config(self):
+        return self.settings.get_admin_ui_config()
+
+    def set_admin_ui_config(self, value):
+        return self.settings.set_admin_ui_config(value)
+
+    def get_setting(self, key, user=None):
         """Get a setting"""
+        if user is not None:
+            return self.settings.get_user_setting(user, key, None)
         return self.settings.get(key, None)
 
-    def set_setting(self, key, value):
+    def set_setting(self, key, value, user=None):
         """Set a setting"""
-        self.settings[key] = value
+        if user is not None:
+            self.settings.set_user_setting(user, key, value)
+        else:
+            self.settings[key] = value
         return value
+
+    def get_bucket_identity(self, bucket):
+        return get_bucket_identity(bucket)
+
+    def group_buckets_by_user(self):
+        return group_buckets_by_user(self)
+
+    def group_buckets_by_device(self):
+        return group_buckets_by_device(self)
+
+    def get_live_fleet_summary(self):
+        return summarize_live_state(self)
+
+    def get_fleet_users(self):
+        return summarize_users(self)
+
+    def get_fleet_user(self, username, start=None, end=None, device_ids=None):
+        return summarize_user(self, username, start, end, device_ids=device_ids)
+
+    def get_fleet_devices(self):
+        return summarize_devices(self)
+
+    def get_fleet_device(self, device_id, start=None, end=None):
+        return summarize_device(self, device_id, start, end)
+
+    def run_fleet_report(self, report_spec):
+        return run_report(self, report_spec)
+
+    def fleet_sync_handshake(self, payload):
+        return sync_handshake(self, payload)
+
+    def fleet_sync_batch(self, payload):
+        return sync_batch(self, payload)
