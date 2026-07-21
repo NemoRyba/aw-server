@@ -564,6 +564,12 @@ class FleetLiveResource(Resource):
         return jsonify(current_app.api.get_live_fleet_summary())
 
 
+@api.route("/0/fleet/storage")
+class FleetStorageResource(Resource):
+    def get(self):
+        return jsonify(current_app.api.get_fleet_storage())
+
+
 @api.route("/0/fleet/users")
 class FleetUsersResource(Resource):
     def get(self):

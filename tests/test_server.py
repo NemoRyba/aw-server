@@ -26,6 +26,26 @@ def test_info(flask_client):
     assert r.json["testing"]
 
 
+def test_fleet_storage(flask_client, tmp_path, monkeypatch):
+    data_dir = tmp_path / "aw-server"
+    data_dir.mkdir()
+    (data_dir / "events.db").write_bytes(b"stored data")
+    nested = data_dir / "nested"
+    nested.mkdir()
+    (nested / "sync.db").write_bytes(b"sync")
+
+    monkeypatch.setattr("aw_server.api.get_data_dir", lambda _app: str(data_dir))
+
+    r = flask_client.get("/api/0/fleet/storage")
+
+    assert r.status_code == 200
+    assert r.json["data_dir"] == str(data_dir)
+    assert r.json["data_size_bytes"] == len(b"stored data") + len(b"sync")
+    assert r.json["disk_total_bytes"] >= r.json["disk_free_bytes"] >= 0
+    assert r.json["disk_used_bytes"] >= 0
+    assert r.json["generated_at"]
+
+
 def test_buckets(flask_client, bucket, benchmark):
     @benchmark
     def list_buckets():

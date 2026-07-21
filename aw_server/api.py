@@ -1,6 +1,7 @@
 import functools
 import json
 import logging
+import shutil
 from datetime import datetime
 from pathlib import Path
 from socket import gethostname
@@ -59,6 +60,20 @@ def check_bucket_exists(f):
         return f(self, bucket_id, *args, **kwargs)
 
     return g
+
+
+def _directory_size(path: Path) -> int:
+    total = 0
+    if not path.exists():
+        return total
+
+    for child in path.rglob("*"):
+        try:
+            if child.is_file():
+                total += child.stat().st_size
+        except OSError:
+            logger.warning("Unable to include path in storage size scan: %s", child)
+    return total
 
 
 class ServerAPI:
@@ -411,6 +426,20 @@ class ServerAPI:
 
     def get_live_fleet_summary(self):
         return summarize_live_state(self)
+
+    def get_fleet_storage(self):
+        data_dir = Path(get_data_dir("aw-server"))
+        data_dir.mkdir(parents=True, exist_ok=True)
+        disk_usage = shutil.disk_usage(data_dir)
+
+        return {
+            "generated_at": datetime.now().astimezone().isoformat(),
+            "data_dir": str(data_dir),
+            "data_size_bytes": _directory_size(data_dir),
+            "disk_total_bytes": disk_usage.total,
+            "disk_used_bytes": disk_usage.used,
+            "disk_free_bytes": disk_usage.free,
+        }
 
     def get_fleet_users(self):
         return summarize_users(self)
