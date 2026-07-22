@@ -324,6 +324,72 @@ def test_fleet_user_and_device_summary(flask_client):
             _delete_bucket(flask_client, bucket_id)
 
 
+def test_fleet_user_summary_merges_overlapping_state_events(flask_client):
+    suffix = str(random.randint(0, 10**6))
+    username = f"fleetoverlap-{suffix}"
+    device_id = f"pc-{suffix}"
+    hostname = f"host-{suffix}"
+    metadata = {
+        "username": username,
+        "device_id": device_id,
+        "device_name": hostname,
+        "session_id": "1",
+        "session_type": "interactive",
+    }
+    bucket_id = f"aw-watcher-afk__{device_id}__{username}__1"
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    end = start + timedelta(hours=1)
+
+    try:
+        _create_bucket(flask_client, bucket_id, "afkstatus", hostname, metadata)
+
+        _create_event(
+            flask_client,
+            bucket_id,
+            start + timedelta(minutes=10),
+            600,
+            {**metadata, "status": "afk"},
+        )
+        _create_event(
+            flask_client,
+            bucket_id,
+            start + timedelta(minutes=10),
+            300,
+            {**metadata, "status": "afk"},
+        )
+        _create_event(
+            flask_client,
+            bucket_id,
+            start + timedelta(minutes=15),
+            600,
+            {**metadata, "status": "afk"},
+        )
+        _create_event(
+            flask_client,
+            bucket_id,
+            start + timedelta(minutes=30),
+            600,
+            {**metadata, "status": "not-afk"},
+        )
+        _create_event(
+            flask_client,
+            bucket_id,
+            start + timedelta(minutes=35),
+            600,
+            {**metadata, "status": "not-afk"},
+        )
+
+        detail_r = flask_client.get(
+            f"/api/0/fleet/users/{username}?start={start.isoformat()}&end={end.isoformat()}"
+        )
+
+        assert detail_r.status_code == 200
+        assert detail_r.json["totals"]["afk_seconds"] == 900
+        assert detail_r.json["totals"]["active_seconds"] == 900
+    finally:
+        _delete_bucket(flask_client, bucket_id)
+
+
 def test_fleet_user_multi_device_filter(flask_client):
     suffix = str(random.randint(0, 10**6))
     username = f"fleetmulti-{suffix}"

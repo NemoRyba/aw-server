@@ -496,7 +496,9 @@ def _sum_bucket_event_seconds(
     end: datetime,
     predicate,
 ) -> float:
-    total_seconds = 0.0
+    intervals_by_session: Dict[
+        Tuple[str, str, str], List[Tuple[datetime, datetime]]
+    ] = defaultdict(list)
     selected_device_ids = _normalize_device_ids(device_id=device_id, device_ids=device_ids)
     for bucket in _matching_buckets(
         api,
@@ -513,7 +515,16 @@ def _sum_bucket_event_seconds(
             if not _matches_device_filter(identity["device_id"], selected_device_ids):
                 continue
             if predicate(dict(event.get("data") or {})):
-                total_seconds += _clip_event_seconds(event, start, end)
+                interval = _clip_event_interval(event, start, end)
+                if interval is not None:
+                    intervals_by_session[_identity_session_key(identity)].append(interval)
+
+    total_seconds = 0.0
+    for intervals in intervals_by_session.values():
+        total_seconds += sum(
+            (interval_end - interval_start).total_seconds()
+            for interval_start, interval_end in _merge_intervals(intervals)
+        )
     return total_seconds
 
 
