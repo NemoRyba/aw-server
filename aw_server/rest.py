@@ -153,6 +153,7 @@ def _auth_payload():
         "user": {
             "username": username,
             "is_admin": bool(user.get("is_admin", False)),
+            "source": str(user.get("source") or "local"),
         },
     }
 
@@ -194,6 +195,18 @@ def _require_admin_user():
     }
 
 
+def _require_builtin_admin_user():
+    user = _require_admin_user()
+    if current_app.api.testing:
+        return user
+    if user["username"] != "admin":
+        raise Unauthorized(
+            "BuiltinAdminRequired",
+            "Only the built-in admin user can manage authentication settings",
+        )
+    return user
+
+
 @api.route("/0/auth/session")
 class AuthSessionResource(Resource):
     def get(self):
@@ -212,7 +225,7 @@ class AuthLoginResource(Resource):
         if not user:
             raise Unauthorized("InvalidCredentials", "Invalid username or password")
 
-        session["aw_auth_user"] = username
+        session["aw_auth_user"] = user["username"]
         session.permanent = True
         return jsonify(_auth_payload())
 
@@ -519,6 +532,52 @@ class AdminUiConfigResource(Resource):
     def post(self):
         _require_admin_user()
         return jsonify(current_app.api.set_admin_ui_config(request.get_json() or {}))
+
+
+@api.route("/0/admin/auth/ldap")
+class AdminAuthLdapResource(Resource):
+    def get(self):
+        _require_builtin_admin_user()
+        return jsonify(current_app.api.get_ldap_config())
+
+    def post(self):
+        _require_builtin_admin_user()
+        return jsonify(current_app.api.set_ldap_config(request.get_json() or {}))
+
+
+@api.route("/0/admin/auth/ldap/test")
+class AdminAuthLdapTestResource(Resource):
+    def post(self):
+        _require_builtin_admin_user()
+        data = request.get_json() or {}
+        return jsonify(
+            current_app.api.test_ldap_config(
+                value=data.get("config"),
+                username=str(data.get("username") or ""),
+                password=str(data.get("password") or ""),
+            )
+        )
+
+
+@api.route("/0/admin/auth/users")
+class AdminAuthUsersResource(Resource):
+    def get(self):
+        _require_builtin_admin_user()
+        return jsonify({"users": current_app.api.list_auth_users()})
+
+
+@api.route("/0/admin/auth/users/<path:username>")
+class AdminAuthUserResource(Resource):
+    def post(self, username):
+        _require_builtin_admin_user()
+        data = request.get_json() or {}
+        user = current_app.api.set_auth_user_admin(
+            username,
+            bool(data.get("is_admin", False)),
+        )
+        if not user:
+            raise BadRequest("UnknownAuthUser", "Authentication user not found")
+        return jsonify(user)
 
 
 # FLEET

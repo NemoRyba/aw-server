@@ -397,6 +397,25 @@ class ServerAPI:
     def authenticate_user(self, username, password):
         return self.settings.authenticate_user(username, password)
 
+    def list_auth_users(self):
+        return self.settings.list_auth_users()
+
+    def set_auth_user_admin(self, username, is_admin):
+        return self.settings.set_auth_user_admin(username, is_admin)
+
+    def get_ldap_config(self):
+        return self.settings.get_ldap_config()
+
+    def set_ldap_config(self, value):
+        return self.settings.set_ldap_config(value)
+
+    def test_ldap_config(self, value=None, username="", password=""):
+        return self.settings.test_ldap_config(
+            value=value,
+            username=username,
+            password=password,
+        )
+
     def get_admin_ui_config(self):
         return self.settings.get_admin_ui_config()
 

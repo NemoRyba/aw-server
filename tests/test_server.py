@@ -26,6 +26,145 @@ def test_info(flask_client):
     assert r.json["testing"]
 
 
+def test_admin_auth_ldap_config_hides_bind_password(flask_client):
+    settings = flask_client.application.api.settings
+    original = settings.data.get(settings.LDAP_CONFIG_KEY)
+
+    try:
+        r = flask_client.post(
+            "/api/0/admin/auth/ldap",
+            json={
+                "enabled": True,
+                "server_url": "ldap://dc.example.local",
+                "default_domain": "example.local",
+                "base_dn": "DC=example,DC=local",
+                "bind_dn": "CN=aw,DC=example,DC=local",
+                "bind_password": "secret-password",
+                "user_search_filter": "(sAMAccountName={username})",
+            },
+        )
+        assert r.status_code == 200
+        assert "bind_password" not in r.json
+        assert r.json["bind_password_present"] is True
+
+        r = flask_client.post(
+            "/api/0/admin/auth/ldap",
+            json={
+                **r.json,
+                "default_domain": "changed.local",
+            },
+        )
+        assert r.status_code == 200
+        assert r.json["bind_password_present"] is True
+        assert (
+            settings.data[settings.LDAP_CONFIG_KEY]["bind_password"]
+            == "secret-password"
+        )
+
+        r = flask_client.post(
+            "/api/0/admin/auth/ldap",
+            json={
+                **r.json,
+                "clear_bind_password": True,
+            },
+        )
+        assert r.status_code == 200
+        assert r.json["bind_password_present"] is False
+        assert settings.data[settings.LDAP_CONFIG_KEY]["bind_password"] == ""
+    finally:
+        if original is None:
+            settings.data.pop(settings.LDAP_CONFIG_KEY, None)
+        else:
+            settings.data[settings.LDAP_CONFIG_KEY] = original
+        settings.save()
+
+
+def test_ldap_login_creates_non_admin_user_that_can_be_promoted(
+    flask_client, monkeypatch
+):
+    suffix = str(random.randint(0, 10**6))
+    raw_username = f"DOMAIN\\LdapUser{suffix}"
+    canonical_username = f"ldapuser{suffix}".lower()
+    settings = flask_client.application.api.settings
+    original_config = settings.data.get(settings.LDAP_CONFIG_KEY)
+    original_user = settings.data.get(settings.AUTH_USERS_KEY, {}).get(canonical_username)
+
+    def fake_ldap_auth(username, password, config=None, persist=True):
+        assert password == "correct-password"
+        attrs = {
+            "sAMAccountName": [canonical_username],
+            "displayName": ["LDAP User"],
+            "mail": [f"{canonical_username}@example.local"],
+        }
+        if not persist:
+            return {
+                "username": canonical_username,
+                "is_admin": False,
+                "source": settings.LDAP_AUTH_SOURCE,
+            }
+        return settings._record_ldap_login(
+            username,
+            attrs=attrs,
+            dn=f"CN={canonical_username},DC=example,DC=local",
+        )
+
+    monkeypatch.setattr(settings, "_authenticate_ldap_user", fake_ldap_auth)
+
+    try:
+        settings.set_ldap_config(
+            {
+                "enabled": True,
+                "server_url": "ldap://dc.example.local",
+                "default_domain": "example.local",
+                "base_dn": "DC=example,DC=local",
+            }
+        )
+
+        r = flask_client.post(
+            "/api/0/auth/login",
+            json={"username": raw_username, "password": "correct-password"},
+        )
+        assert r.status_code == 200
+        assert r.json["user"]["username"] == canonical_username
+        assert r.json["user"]["source"] == "ldap"
+        assert r.json["user"]["is_admin"] is False
+
+        r = flask_client.get("/api/0/admin/auth/users")
+        assert r.status_code == 200
+        ldap_user = next(
+            user for user in r.json["users"] if user["username"] == canonical_username
+        )
+        assert ldap_user["source"] == "ldap"
+        assert ldap_user["is_admin"] is False
+
+        r = flask_client.post(
+            f"/api/0/admin/auth/users/{canonical_username}",
+            json={"is_admin": True},
+        )
+        assert r.status_code == 200
+        assert r.json["is_admin"] is True
+
+        r = flask_client.post(
+            "/api/0/auth/login",
+            json={"username": raw_username, "password": "correct-password"},
+        )
+        assert r.status_code == 200
+        assert r.json["user"]["username"] == canonical_username
+        assert r.json["user"]["is_admin"] is True
+    finally:
+        if original_config is None:
+            settings.data.pop(settings.LDAP_CONFIG_KEY, None)
+        else:
+            settings.data[settings.LDAP_CONFIG_KEY] = original_config
+
+        users = settings.data.setdefault(settings.AUTH_USERS_KEY, {})
+        if original_user is None:
+            users.pop(canonical_username, None)
+        else:
+            users[canonical_username] = original_user
+        settings.save()
+
+
 def test_fleet_storage(flask_client, tmp_path, monkeypatch):
     data_dir = tmp_path / "aw-server"
     data_dir.mkdir()

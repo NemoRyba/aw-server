@@ -23,7 +23,7 @@ a = Analysis(
         (os.path.join(restx_path, "static"), "flask_restx/static"),
         (os.path.join(aw_core_path, "schemas"), "aw_core/schemas"),
     ],
-    hiddenimports=[],
+    hiddenimports=["ldap3", "ldap3.core.exceptions", "ldap3.utils.conv", "pyasn1"],
     hookspath=[],
     runtime_hooks=[],
     excludes=[],
