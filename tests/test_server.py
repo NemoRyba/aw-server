@@ -141,6 +141,23 @@ def _delete_bucket(flask_client, bucket_id):
     assert r.status_code == 200
 
 
+def test_buckets_include_event_count(flask_client):
+    suffix = str(random.randint(0, 10**6))
+    bucket_id = f"test-event-count-{suffix}"
+    now = datetime.now(timezone.utc)
+
+    try:
+        _create_bucket(flask_client, bucket_id, "test", "test-host", {})
+        _create_event(flask_client, bucket_id, now, 1, {"state": "one"})
+        _create_event(flask_client, bucket_id, now + timedelta(seconds=1), 1, {"state": "two"})
+
+        r = flask_client.get("/api/0/buckets/")
+        assert r.status_code == 200
+        assert r.json[bucket_id]["event_count"] == 2
+    finally:
+        _delete_bucket(flask_client, bucket_id)
+
+
 def _fleet_sync_handshake(flask_client, agent, streams):
     r = flask_client.post(
         "/api/0/fleet/sync/handshake",
@@ -231,6 +248,84 @@ def test_fleet_live(flask_client):
     finally:
         for bucket_id in bucket_ids:
             _delete_bucket(flask_client, bucket_id)
+
+
+def test_fleet_live_hides_old_terminal_sessions(flask_client):
+    suffix = str(random.randint(0, 10**6))
+    username = f"fleettermdone-{suffix}"
+    device_id = f"pc-term-done-{suffix}"
+    hostname = f"host-term-done-{suffix}"
+    metadata = {
+        "username": username,
+        "device_id": device_id,
+        "device_name": hostname,
+        "session_id": "8",
+        "session_type": "console",
+    }
+    bucket_id = f"aw-watcher-session__{device_id}__{username}__8"
+    old_terminal_time = datetime.now(timezone.utc) - timedelta(minutes=20)
+
+    try:
+        _create_bucket(flask_client, bucket_id, "sessionstate", hostname, metadata)
+        _create_event(
+            flask_client,
+            bucket_id,
+            old_terminal_time,
+            0,
+            {**metadata, "state": "disconnected", "reason": "rdp"},
+        )
+
+        r = flask_client.get("/api/0/fleet/live")
+        assert r.status_code == 200
+        assert not any(
+            row["username"] == username and row["device_id"] == device_id
+            for row in r.json["users"]
+        )
+        assert not any(row["device_id"] == device_id for row in r.json["devices"])
+    finally:
+        _delete_bucket(flask_client, bucket_id)
+
+
+def test_fleet_users_does_not_count_disconnected_as_active(flask_client):
+    suffix = str(random.randint(0, 10**6))
+    username = f"fleetdisconnected-{suffix}"
+    device_id = f"pc-disconnected-{suffix}"
+    hostname = f"host-disconnected-{suffix}"
+    metadata = {
+        "username": username,
+        "device_id": device_id,
+        "device_name": hostname,
+        "session_id": "9",
+        "session_type": "console",
+    }
+    bucket_id = f"aw-watcher-session__{device_id}__{username}__9"
+    recent_terminal_time = datetime.now(timezone.utc) - timedelta(minutes=1)
+
+    try:
+        _create_bucket(flask_client, bucket_id, "sessionstate", hostname, metadata)
+        _create_event(
+            flask_client,
+            bucket_id,
+            recent_terminal_time,
+            0,
+            {**metadata, "state": "disconnected", "reason": "rdp"},
+        )
+
+        live_r = flask_client.get("/api/0/fleet/live")
+        assert live_r.status_code == 200
+        session = next(
+            row
+            for row in live_r.json["users"]
+            if row["username"] == username and row["device_id"] == device_id
+        )
+        assert session["state"] == "disconnected"
+
+        users_r = flask_client.get("/api/0/fleet/users")
+        assert users_r.status_code == 200
+        user = next(row for row in users_r.json["users"] if row["username"] == username)
+        assert user["active_sessions"] == 0
+    finally:
+        _delete_bucket(flask_client, bucket_id)
 
 
 def test_fleet_user_and_device_summary(flask_client):

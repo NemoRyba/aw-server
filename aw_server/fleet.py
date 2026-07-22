@@ -11,6 +11,8 @@ WATCHER_KIND_BY_TYPE = {
 }
 
 LIVE_STALE_AFTER = timedelta(minutes=2)
+LIVE_TERMINAL_SESSION_RETENTION = timedelta(minutes=15)
+LIVE_TERMINAL_STATES = {"disconnected", "logged_off", "no_session"}
 DEFAULT_REPORT_RANGE = timedelta(days=7)
 
 
@@ -259,6 +261,17 @@ def _derive_effective_state(session_state: Optional[str], afk_status: Optional[s
     return "unknown"
 
 
+def _is_expired_terminal_session(session: Dict[str, Any], now: datetime) -> bool:
+    if session.get("state") not in LIVE_TERMINAL_STATES:
+        return False
+
+    last_updated = _parse_datetime(session.get("last_updated"))
+    if last_updated is None:
+        return False
+
+    return now - last_updated > LIVE_TERMINAL_SESSION_RETENTION
+
+
 def summarize_live_state(api) -> Dict[str, Any]:
     snapshots = _load_live_snapshots(api)
     sessions: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
@@ -307,12 +320,15 @@ def summarize_live_state(api) -> Dict[str, Any]:
             session["process_path"] = data.get("process_path") or session["process_path"]
             session["explorer_path"] = data.get("explorer_path") or session["explorer_path"]
 
+    now = _utcnow()
     session_rows = []
     for session in sessions.values():
         session["state"] = _derive_effective_state(
             session.get("session_state"), session.get("afk_status")
         )
         session["last_updated"] = _isoformat(session.pop("_last_updated_dt"))
+        if _is_expired_terminal_session(session, now):
+            continue
         session_rows.append(session)
 
     session_rows = sorted(
@@ -325,7 +341,6 @@ def summarize_live_state(api) -> Dict[str, Any]:
     )
 
     devices: Dict[str, Dict[str, Any]] = {}
-    now = _utcnow()
     for session in session_rows:
         device = devices.setdefault(
             session["device_id"],
@@ -424,7 +439,7 @@ def summarize_users(api) -> Dict[str, Any]:
             last_updated is not None and last_updated > user["last_seen"]
         ):
             user["last_seen"] = last_updated
-        if session.get("state") not in {"logged_off", "no_session"}:
+        if session.get("state") not in LIVE_TERMINAL_STATES:
             user["active_sessions"] += 1
 
     rows = []

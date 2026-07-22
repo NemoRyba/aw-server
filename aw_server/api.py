@@ -99,6 +99,7 @@ class ServerAPI:
         logger.debug("Received get request for buckets")
         buckets = self.db.buckets()
         for b in buckets:
+            buckets[b]["event_count"] = self.db[b].get_eventcount()
             # TODO: Move this code to aw-core?
             last_events = self.db[b].get(limit=1)
             if len(last_events) > 0:
