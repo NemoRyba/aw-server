@@ -747,6 +747,39 @@ def _merge_intervals(
     return merged
 
 
+def _sum_intervals(intervals: Iterable[Tuple[datetime, datetime]]) -> float:
+    return sum(
+        (interval_end - interval_start).total_seconds()
+        for interval_start, interval_end in _merge_intervals(intervals)
+    )
+
+
+def _subtract_intervals(
+    intervals: Iterable[Tuple[datetime, datetime]],
+    subtract_intervals: Iterable[Tuple[datetime, datetime]],
+) -> List[Tuple[datetime, datetime]]:
+    subtract = _merge_intervals(subtract_intervals)
+    if not subtract:
+        return _merge_intervals(intervals)
+
+    result: List[Tuple[datetime, datetime]] = []
+    for interval_start, interval_end in _merge_intervals(intervals):
+        cursor = interval_start
+        for subtract_start, subtract_end in subtract:
+            if subtract_end <= cursor:
+                continue
+            if subtract_start >= interval_end:
+                break
+            if subtract_start > cursor:
+                result.append((cursor, min(subtract_start, interval_end)))
+            cursor = max(cursor, subtract_end)
+            if cursor >= interval_end:
+                break
+        if cursor < interval_end:
+            result.append((cursor, interval_end))
+    return result
+
+
 def _interval_overlap_seconds(
     start: datetime, end: datetime, other_start: datetime, other_end: datetime
 ) -> float:
@@ -878,6 +911,93 @@ def _load_active_session_intervals(
         active_intervals[session_key] = _merge_intervals(intervals)
 
     return active_intervals, known_sessions
+
+
+def _load_session_state_intervals(
+    api,
+    *,
+    username: Optional[str] = None,
+    device_id: Optional[str] = None,
+    device_ids: Optional[Iterable[str]] = None,
+    start: datetime,
+    end: datetime,
+) -> Dict[str, List[Tuple[datetime, datetime]]]:
+    selected_device_ids = _normalize_device_ids(device_id=device_id, device_ids=device_ids)
+    intervals_by_state: Dict[str, List[Tuple[datetime, datetime]]] = defaultdict(list)
+
+    for bucket in _matching_buckets(
+        api,
+        kind="session",
+        username=username,
+        device_id=device_id,
+        device_ids=device_ids,
+    ):
+        events = api.get_events(bucket["bucket_id"], limit=-1, start=start, end=end)
+        for event in events:
+            identity = _event_identity(bucket, event)
+            if username is not None and identity["username"] != username:
+                continue
+            if not _matches_device_filter(identity["device_id"], selected_device_ids):
+                continue
+
+            state = str(dict(event.get("data") or {}).get("state") or "").strip()
+            if not state:
+                continue
+
+            interval = _clip_event_interval(event, start, end)
+            if interval is None:
+                continue
+
+            intervals_by_state[state].append(interval)
+
+    return {
+        state: _merge_intervals(intervals)
+        for state, intervals in intervals_by_state.items()
+    }
+
+
+def _session_state_totals(
+    api,
+    *,
+    username: Optional[str] = None,
+    device_id: Optional[str] = None,
+    device_ids: Optional[Iterable[str]] = None,
+    start: datetime,
+    end: datetime,
+) -> Dict[str, float]:
+    intervals_by_state = _load_session_state_intervals(
+        api,
+        username=username,
+        device_id=device_id,
+        device_ids=device_ids,
+        start=start,
+        end=end,
+    )
+
+    active_intervals = intervals_by_state.get("active", [])
+    locked_intervals = _subtract_intervals(
+        intervals_by_state.get("locked", []),
+        active_intervals,
+    )
+    active_or_locked_intervals = _merge_intervals(active_intervals + locked_intervals)
+    disconnected_intervals = _subtract_intervals(
+        intervals_by_state.get("disconnected", []),
+        active_or_locked_intervals,
+    )
+    occupied_intervals = _merge_intervals(
+        active_or_locked_intervals + disconnected_intervals
+    )
+    logged_in_intervals = _subtract_intervals(
+        intervals_by_state.get("logged_in", []),
+        occupied_intervals,
+    )
+
+    return {
+        "active_seconds": _sum_intervals(active_intervals),
+        "locked_seconds": _sum_intervals(locked_intervals),
+        "disconnected_seconds": _sum_intervals(disconnected_intervals),
+        "logged_in_seconds": _sum_intervals(logged_in_intervals),
+    }
 
 
 def _window_event_breakdown(
@@ -1098,14 +1218,12 @@ def summarize_user(
         )
 
     totals = {
-        "active_seconds": _sum_bucket_event_seconds(
+        **_session_state_totals(
             api,
-            kind="afk",
             username=username,
             device_ids=selected_device_ids,
             start=start,
             end=end,
-            predicate=lambda data: data.get("status") == "not-afk",
         ),
         "afk_seconds": _sum_bucket_event_seconds(
             api,
@@ -1117,33 +1235,6 @@ def summarize_user(
             predicate=lambda data: data.get("status") == "afk",
             restrict_to_intervals_by_session=active_session_intervals,
             restrict_known_sessions=known_session_keys,
-        ),
-        "locked_seconds": _sum_bucket_event_seconds(
-            api,
-            kind="session",
-            username=username,
-            device_ids=selected_device_ids,
-            start=start,
-            end=end,
-            predicate=lambda data: data.get("state") == "locked",
-        ),
-        "disconnected_seconds": _sum_bucket_event_seconds(
-            api,
-            kind="session",
-            username=username,
-            device_ids=selected_device_ids,
-            start=start,
-            end=end,
-            predicate=lambda data: data.get("state") == "disconnected",
-        ),
-        "logged_in_seconds": _sum_bucket_event_seconds(
-            api,
-            kind="session",
-            username=username,
-            device_ids=selected_device_ids,
-            start=start,
-            end=end,
-            predicate=lambda data: data.get("state") == "logged_in",
         ),
     }
 
@@ -1231,13 +1322,11 @@ def summarize_device(
         )
 
     totals = {
-        "active_seconds": _sum_bucket_event_seconds(
+        **_session_state_totals(
             api,
-            kind="afk",
             device_id=device_id,
             start=start,
             end=end,
-            predicate=lambda data: data.get("status") == "not-afk",
         ),
         "afk_seconds": _sum_bucket_event_seconds(
             api,
@@ -1248,30 +1337,6 @@ def summarize_device(
             predicate=lambda data: data.get("status") == "afk",
             restrict_to_intervals_by_session=active_session_intervals,
             restrict_known_sessions=known_session_keys,
-        ),
-        "locked_seconds": _sum_bucket_event_seconds(
-            api,
-            kind="session",
-            device_id=device_id,
-            start=start,
-            end=end,
-            predicate=lambda data: data.get("state") == "locked",
-        ),
-        "disconnected_seconds": _sum_bucket_event_seconds(
-            api,
-            kind="session",
-            device_id=device_id,
-            start=start,
-            end=end,
-            predicate=lambda data: data.get("state") == "disconnected",
-        ),
-        "logged_in_seconds": _sum_bucket_event_seconds(
-            api,
-            kind="session",
-            device_id=device_id,
-            start=start,
-            end=end,
-            predicate=lambda data: data.get("state") == "logged_in",
         ),
     }
 
