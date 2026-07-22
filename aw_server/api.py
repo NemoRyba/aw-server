@@ -27,8 +27,9 @@ from .fleet import (
     group_buckets_by_device,
     group_buckets_by_user,
     run_report,
-    summarize_devices,
     summarize_device,
+    summarize_device_metrics,
+    summarize_devices,
     summarize_live_state,
     summarize_user,
     summarize_users,
@@ -464,6 +465,17 @@ class ServerAPI:
 
     def get_fleet_devices(self):
         return summarize_devices(self)
+
+    def get_fleet_device_metrics(
+        self, start=None, end=None, device_ids=None, max_points=180
+    ):
+        return summarize_device_metrics(
+            self,
+            start=start,
+            end=end,
+            device_ids=device_ids,
+            max_points=max_points,
+        )
 
     def get_fleet_device(
         self, device_id, start=None, end=None, exclude_inactive_session_afk=False

@@ -286,6 +286,65 @@ def test_fleet_live_hides_old_terminal_sessions(flask_client):
         _delete_bucket(flask_client, bucket_id)
 
 
+def test_fleet_device_metrics(flask_client):
+    suffix = str(random.randint(0, 10**6))
+    device_id = f"metrics-pc-{suffix}"
+    hostname = f"metrics-host-{suffix}"
+    bucket_id = f"aw-watcher-system__{device_id}__system__machine"
+    now = datetime.now(timezone.utc)
+    metadata = {
+        "username": "system",
+        "device_id": device_id,
+        "device_name": hostname,
+        "session_id": "machine",
+        "session_type": "machine",
+    }
+
+    try:
+        _create_bucket(flask_client, bucket_id, "systemmetrics", hostname, metadata)
+        _create_event(
+            flask_client,
+            bucket_id,
+            now - timedelta(minutes=2),
+            60,
+            {**metadata, "metric": "cpu_load", "cpu_percent": 21.0},
+        )
+        _create_event(
+            flask_client,
+            bucket_id,
+            now - timedelta(minutes=1),
+            60,
+            {
+                **metadata,
+                "metric": "system_load",
+                "cpu_percent": 33.5,
+                "memory_percent": 68.2,
+                "memory_used_bytes": 6_820,
+                "memory_total_bytes": 10_000,
+            },
+        )
+
+        r = flask_client.get(
+            "/api/0/fleet/devices/metrics"
+            f"?device_id={device_id}&start={(now - timedelta(minutes=5)).isoformat()}"
+            f"&end={now.isoformat()}&max_points=20"
+        )
+
+        assert r.status_code == 200
+        assert len(r.json["devices"]) == 1
+        device = r.json["devices"][0]
+        assert device["device_id"] == device_id
+        assert device["device_name"] == hostname
+        assert device["latest_cpu_percent"] == 33.5
+        assert device["latest_memory_percent"] == 68.2
+        assert len(device["samples"]) == 2
+        assert device["samples"][0]["cpu_percent"] == 21.0
+        assert device["samples"][0]["memory_percent"] is None
+        assert device["samples"][1]["memory_used_bytes"] == 6_820
+    finally:
+        _delete_bucket(flask_client, bucket_id)
+
+
 def test_fleet_users_does_not_count_disconnected_as_active(flask_client):
     suffix = str(random.randint(0, 10**6))
     username = f"fleetdisconnected-{suffix}"

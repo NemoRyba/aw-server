@@ -1,5 +1,6 @@
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from math import ceil
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import iso8601
@@ -473,6 +474,155 @@ def summarize_devices(api) -> Dict[str, Any]:
         )
     rows = sorted(rows, key=lambda item: item["device_name"] or item["device_id"])
     return {"devices": rows}
+
+
+def _system_metric_buckets(api) -> Iterable[Dict[str, Any]]:
+    for bucket in api.get_buckets().values():
+        if bucket.get("type") != "systemmetrics":
+            continue
+        identity = get_bucket_identity(bucket)
+        yield {
+            "kind": "system",
+            "bucket_id": bucket["id"],
+            "client": bucket.get("client"),
+            **identity,
+        }
+
+
+def _metric_float(data: Dict[str, Any], key: str) -> Optional[float]:
+    value = data.get(key)
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _metric_int(data: Dict[str, Any], key: str) -> Optional[int]:
+    value = data.get(key)
+    if value in (None, ""):
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _average_present(values: Iterable[Optional[float]]) -> Optional[float]:
+    present = [float(value) for value in values if value is not None]
+    if not present:
+        return None
+    return round(sum(present) / len(present), 1)
+
+
+def _average_present_int(values: Iterable[Optional[int]]) -> Optional[int]:
+    present = [int(value) for value in values if value is not None]
+    if not present:
+        return None
+    return int(round(sum(present) / len(present)))
+
+
+def _downsample_metric_samples(
+    samples: List[Dict[str, Any]], max_points: int
+) -> List[Dict[str, Any]]:
+    if max_points <= 0 or len(samples) <= max_points:
+        return samples
+
+    chunk_size = max(1, ceil(len(samples) / max_points))
+    downsampled = []
+    for index in range(0, len(samples), chunk_size):
+        chunk = samples[index : index + chunk_size]
+        last = chunk[-1]
+        downsampled.append(
+            {
+                "timestamp": last["timestamp"],
+                "cpu_percent": _average_present(
+                    sample.get("cpu_percent") for sample in chunk
+                ),
+                "memory_percent": _average_present(
+                    sample.get("memory_percent") for sample in chunk
+                ),
+                "memory_used_bytes": _average_present_int(
+                    sample.get("memory_used_bytes") for sample in chunk
+                ),
+                "memory_total_bytes": last.get("memory_total_bytes"),
+            }
+        )
+    return downsampled
+
+
+def summarize_device_metrics(
+    api,
+    start: Optional[datetime] = None,
+    end: Optional[datetime] = None,
+    device_ids: Optional[Iterable[str]] = None,
+    max_points: int = 180,
+) -> Dict[str, Any]:
+    start, end = _normalize_range(start, end)
+    selected_device_ids = _normalize_device_ids(device_ids=device_ids)
+    devices: Dict[str, Dict[str, Any]] = {}
+
+    for bucket in _system_metric_buckets(api):
+        if not _matches_device_filter(bucket["device_id"], selected_device_ids):
+            continue
+
+        events = api.get_events(bucket["bucket_id"], limit=-1, start=start, end=end)
+        for event in events:
+            identity = _event_identity(bucket, event)
+            if not _matches_device_filter(identity["device_id"], selected_device_ids):
+                continue
+
+            timestamp = _parse_datetime(event.get("timestamp"))
+            if timestamp is None:
+                continue
+
+            data = dict(event.get("data") or {})
+            sample = {
+                "timestamp": _isoformat(timestamp),
+                "cpu_percent": _metric_float(data, "cpu_percent"),
+                "memory_percent": _metric_float(data, "memory_percent"),
+                "memory_used_bytes": _metric_int(data, "memory_used_bytes"),
+                "memory_total_bytes": _metric_int(data, "memory_total_bytes"),
+            }
+            if sample["cpu_percent"] is None and sample["memory_percent"] is None:
+                continue
+
+            device = devices.setdefault(
+                identity["device_id"],
+                {
+                    "device_id": identity["device_id"],
+                    "device_name": identity["device_name"],
+                    "samples": [],
+                },
+            )
+            if identity.get("device_name") not in (None, "", "unknown"):
+                device["device_name"] = identity["device_name"]
+            device["samples"].append(sample)
+
+    rows = []
+    for device in devices.values():
+        samples = sorted(device["samples"], key=lambda sample: sample["timestamp"])
+        latest = samples[-1] if samples else {}
+        rows.append(
+            {
+                "device_id": device["device_id"],
+                "device_name": device["device_name"],
+                "last_updated": latest.get("timestamp"),
+                "latest_cpu_percent": latest.get("cpu_percent"),
+                "latest_memory_percent": latest.get("memory_percent"),
+                "latest_memory_used_bytes": latest.get("memory_used_bytes"),
+                "latest_memory_total_bytes": latest.get("memory_total_bytes"),
+                "samples": _downsample_metric_samples(samples, max_points),
+            }
+        )
+
+    rows = sorted(rows, key=lambda item: item["device_name"] or item["device_id"])
+    return {
+        "generated_at": _utcnow().isoformat(),
+        "range": {"start": _isoformat(start), "end": _isoformat(end)},
+        "devices": rows,
+    }
 
 
 def _matching_buckets(

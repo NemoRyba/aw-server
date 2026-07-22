@@ -560,6 +560,14 @@ def _fleet_bool_arg(name: str, default: bool = False) -> bool:
     return value in {"1", "true", "yes", "on"}
 
 
+def _fleet_int_arg(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(request.args.get(name, default))
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, value))
+
+
 def _parse_query_date(value: str):
     normalized = value.replace(" ", "+")
     return iso8601.parse_date(normalized)
@@ -604,6 +612,20 @@ class FleetUserResource(Resource):
 class FleetDevicesResource(Resource):
     def get(self):
         return jsonify(current_app.api.get_fleet_devices())
+
+
+@api.route("/0/fleet/devices/metrics")
+class FleetDeviceMetricsResource(Resource):
+    def get(self):
+        start, end = _fleet_range()
+        return jsonify(
+            current_app.api.get_fleet_device_metrics(
+                start=start,
+                end=end,
+                device_ids=_fleet_device_ids(),
+                max_points=_fleet_int_arg("max_points", 180, 20, 720),
+            )
+        )
 
 
 @api.route("/0/fleet/devices/<string:device_id>")
