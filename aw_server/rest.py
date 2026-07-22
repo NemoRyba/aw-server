@@ -553,6 +553,13 @@ def _fleet_device_ids():
     return unique
 
 
+def _fleet_bool_arg(name: str, default: bool = False) -> bool:
+    if name not in request.args:
+        return default
+    value = str(request.args.get(name) or "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
 def _parse_query_date(value: str):
     normalized = value.replace(" ", "+")
     return iso8601.parse_date(normalized)
@@ -586,6 +593,9 @@ class FleetUserResource(Resource):
                 start=start,
                 end=end,
                 device_ids=_fleet_device_ids(),
+                exclude_inactive_session_afk=_fleet_bool_arg(
+                    "exclude_inactive_session_afk"
+                ),
             )
         )
 
@@ -600,7 +610,16 @@ class FleetDevicesResource(Resource):
 class FleetDeviceResource(Resource):
     def get(self, device_id: str):
         start, end = _fleet_range()
-        return jsonify(current_app.api.get_fleet_device(device_id, start=start, end=end))
+        return jsonify(
+            current_app.api.get_fleet_device(
+                device_id,
+                start=start,
+                end=end,
+                exclude_inactive_session_afk=_fleet_bool_arg(
+                    "exclude_inactive_session_afk"
+                ),
+            )
+        )
 
 
 @api.route("/0/fleet/report")

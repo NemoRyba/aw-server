@@ -444,14 +444,36 @@ class ServerAPI:
     def get_fleet_users(self):
         return summarize_users(self)
 
-    def get_fleet_user(self, username, start=None, end=None, device_ids=None):
-        return summarize_user(self, username, start, end, device_ids=device_ids)
+    def get_fleet_user(
+        self,
+        username,
+        start=None,
+        end=None,
+        device_ids=None,
+        exclude_inactive_session_afk=False,
+    ):
+        return summarize_user(
+            self,
+            username,
+            start,
+            end,
+            device_ids=device_ids,
+            exclude_inactive_session_afk=exclude_inactive_session_afk,
+        )
 
     def get_fleet_devices(self):
         return summarize_devices(self)
 
-    def get_fleet_device(self, device_id, start=None, end=None):
-        return summarize_device(self, device_id, start, end)
+    def get_fleet_device(
+        self, device_id, start=None, end=None, exclude_inactive_session_afk=False
+    ):
+        return summarize_device(
+            self,
+            device_id,
+            start,
+            end,
+            exclude_inactive_session_afk=exclude_inactive_session_afk,
+        )
 
     def run_fleet_report(self, report_spec):
         return run_report(self, report_spec)

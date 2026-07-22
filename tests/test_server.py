@@ -390,6 +390,86 @@ def test_fleet_user_summary_merges_overlapping_state_events(flask_client):
         _delete_bucket(flask_client, bucket_id)
 
 
+def test_fleet_user_summary_can_exclude_afk_outside_active_session(flask_client):
+    suffix = str(random.randint(0, 10**6))
+    username = f"fleetafksession-{suffix}"
+    device_id = f"pc-{suffix}"
+    hostname = f"host-{suffix}"
+    metadata = {
+        "username": username,
+        "device_id": device_id,
+        "device_name": hostname,
+        "session_id": "1",
+        "session_type": "interactive",
+    }
+    bucket_ids = [
+        f"aw-watcher-session__{device_id}__{username}__1",
+        f"aw-watcher-afk__{device_id}__{username}__1",
+        f"aw-watcher-window__{device_id}__{username}__1",
+    ]
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    end = start + timedelta(hours=1)
+
+    try:
+        _create_bucket(flask_client, bucket_ids[0], "sessionstate", hostname, metadata)
+        _create_bucket(flask_client, bucket_ids[1], "afkstatus", hostname, metadata)
+        _create_bucket(flask_client, bucket_ids[2], "currentwindow", hostname, metadata)
+
+        _create_event(
+            flask_client,
+            bucket_ids[0],
+            start,
+            600,
+            {**metadata, "state": "active"},
+        )
+        _create_event(
+            flask_client,
+            bucket_ids[0],
+            start + timedelta(minutes=10),
+            1200,
+            {**metadata, "state": "locked"},
+        )
+        _create_event(
+            flask_client,
+            bucket_ids[1],
+            start,
+            1800,
+            {**metadata, "status": "afk"},
+        )
+        _create_event(
+            flask_client,
+            bucket_ids[2],
+            start,
+            1800,
+            {
+                **metadata,
+                "app": "Code.exe",
+                "title": "ActivityWatch",
+                "process_name": "Code.exe",
+            },
+        )
+
+        raw_r = flask_client.get(
+            f"/api/0/fleet/users/{username}?start={start.isoformat()}&end={end.isoformat()}"
+        )
+        filtered_r = flask_client.get(
+            f"/api/0/fleet/users/{username}"
+            f"?start={start.isoformat()}&end={end.isoformat()}"
+            "&exclude_inactive_session_afk=true"
+        )
+
+        assert raw_r.status_code == 200
+        assert filtered_r.status_code == 200
+        assert raw_r.json["totals"]["afk_seconds"] == 1800
+        assert raw_r.json["apps"][0]["afk_seconds"] == 1800
+        assert filtered_r.json["totals"]["afk_seconds"] == 600
+        assert filtered_r.json["apps"][0]["afk_seconds"] == 600
+        assert filtered_r.json["filters"]["exclude_inactive_session_afk"] is True
+    finally:
+        for bucket_id in bucket_ids:
+            _delete_bucket(flask_client, bucket_id)
+
+
 def test_fleet_user_multi_device_filter(flask_client):
     suffix = str(random.randint(0, 10**6))
     username = f"fleetmulti-{suffix}"

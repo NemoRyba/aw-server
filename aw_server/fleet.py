@@ -1,6 +1,6 @@
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import iso8601
 
@@ -495,10 +495,15 @@ def _sum_bucket_event_seconds(
     start: datetime,
     end: datetime,
     predicate,
+    restrict_to_intervals_by_session: Optional[
+        Dict[Tuple[str, str, str], List[Tuple[datetime, datetime]]]
+    ] = None,
+    restrict_known_sessions: Optional[Iterable[Tuple[str, str, str]]] = None,
 ) -> float:
     intervals_by_session: Dict[
         Tuple[str, str, str], List[Tuple[datetime, datetime]]
     ] = defaultdict(list)
+    known_sessions = set(restrict_known_sessions or [])
     selected_device_ids = _normalize_device_ids(device_id=device_id, device_ids=device_ids)
     for bucket in _matching_buckets(
         api,
@@ -517,7 +522,19 @@ def _sum_bucket_event_seconds(
             if predicate(dict(event.get("data") or {})):
                 interval = _clip_event_interval(event, start, end)
                 if interval is not None:
-                    intervals_by_session[_identity_session_key(identity)].append(interval)
+                    session_key = _identity_session_key(identity)
+                    if (
+                        restrict_to_intervals_by_session is not None
+                        and session_key in known_sessions
+                    ):
+                        intervals_by_session[session_key].extend(
+                            _intersect_interval_with_intervals(
+                                interval,
+                                restrict_to_intervals_by_session.get(session_key, []),
+                            )
+                        )
+                    else:
+                        intervals_by_session[session_key].append(interval)
 
     total_seconds = 0.0
     for intervals in intervals_by_session.values():
@@ -526,6 +543,24 @@ def _sum_bucket_event_seconds(
             for interval_start, interval_end in _merge_intervals(intervals)
         )
     return total_seconds
+
+
+def _intersect_interval_with_intervals(
+    interval: Tuple[datetime, datetime],
+    restrict_intervals: Iterable[Tuple[datetime, datetime]],
+) -> List[Tuple[datetime, datetime]]:
+    start, end = interval
+    intersections = []
+    for other_start, other_end in restrict_intervals:
+        if other_end <= start:
+            continue
+        if other_start >= end:
+            break
+        overlap_start = max(start, other_start)
+        overlap_end = min(end, other_end)
+        if overlap_end > overlap_start:
+            intersections.append((overlap_start, overlap_end))
+    return intersections
 
 
 def _merge_intervals(
@@ -569,6 +604,20 @@ def _sum_interval_overlaps(
         if interval_start >= end:
             break
         total += _interval_overlap_seconds(start, end, interval_start, interval_end)
+    return total
+
+
+def _sum_interval_overlaps_with_restriction(
+    start: datetime,
+    end: datetime,
+    intervals: Iterable[Tuple[datetime, datetime]],
+    restrict_intervals: Iterable[Tuple[datetime, datetime]],
+) -> float:
+    total = 0.0
+    for segment_start, segment_end in _intersect_interval_with_intervals(
+        (start, end), restrict_intervals
+    ):
+        total += _sum_interval_overlaps(segment_start, segment_end, intervals)
     return total
 
 
@@ -620,6 +669,52 @@ def _load_afk_intervals(
     return intervals
 
 
+def _load_active_session_intervals(
+    api,
+    *,
+    username: Optional[str] = None,
+    device_id: Optional[str] = None,
+    device_ids: Optional[Iterable[str]] = None,
+    start: datetime,
+    end: datetime,
+) -> Tuple[
+    Dict[Tuple[str, str, str], List[Tuple[datetime, datetime]]],
+    Set[Tuple[str, str, str]],
+]:
+    selected_device_ids = _normalize_device_ids(device_id=device_id, device_ids=device_ids)
+    active_intervals: Dict[Tuple[str, str, str], List[Tuple[datetime, datetime]]] = {}
+    known_sessions: Set[Tuple[str, str, str]] = set()
+
+    for bucket in _matching_buckets(
+        api,
+        kind="session",
+        username=username,
+        device_id=device_id,
+        device_ids=device_ids,
+    ):
+        events = api.get_events(bucket["bucket_id"], limit=-1, start=start, end=end)
+        for event in events:
+            identity = _event_identity(bucket, event)
+            if username is not None and identity["username"] != username:
+                continue
+            if not _matches_device_filter(identity["device_id"], selected_device_ids):
+                continue
+
+            interval = _clip_event_interval(event, start, end)
+            if interval is None:
+                continue
+
+            session_key = _identity_session_key(identity)
+            known_sessions.add(session_key)
+            if dict(event.get("data") or {}).get("state") == "active":
+                active_intervals.setdefault(session_key, []).append(interval)
+
+    for session_key, intervals in list(active_intervals.items()):
+        active_intervals[session_key] = _merge_intervals(intervals)
+
+    return active_intervals, known_sessions
+
+
 def _window_event_breakdown(
     identity: Dict[str, Any],
     event: Dict[str, Any],
@@ -627,6 +722,10 @@ def _window_event_breakdown(
     start: datetime,
     end: datetime,
     afk_intervals: Dict[Tuple[str, str, str], Dict[str, List[Tuple[datetime, datetime]]]],
+    active_session_intervals: Optional[
+        Dict[Tuple[str, str, str], List[Tuple[datetime, datetime]]]
+    ] = None,
+    known_session_keys: Optional[Set[Tuple[str, str, str]]] = None,
 ) -> Tuple[float, float, float]:
     interval = _clip_event_interval(event, start, end)
     if interval is None:
@@ -635,13 +734,22 @@ def _window_event_breakdown(
     interval_start, interval_end = interval
     total_seconds = (interval_end - interval_start).total_seconds()
 
-    session_intervals = afk_intervals.get(_identity_session_key(identity), {})
+    session_key = _identity_session_key(identity)
+    session_intervals = afk_intervals.get(session_key, {})
     active_seconds = _sum_interval_overlaps(
         interval_start, interval_end, session_intervals.get("not-afk", [])
     )
-    afk_seconds = _sum_interval_overlaps(
-        interval_start, interval_end, session_intervals.get("afk", [])
-    )
+    if active_session_intervals is not None and session_key in (known_session_keys or set()):
+        afk_seconds = _sum_interval_overlaps_with_restriction(
+            interval_start,
+            interval_end,
+            session_intervals.get("afk", []),
+            active_session_intervals.get(session_key, []),
+        )
+    else:
+        afk_seconds = _sum_interval_overlaps(
+            interval_start, interval_end, session_intervals.get("afk", [])
+        )
 
     if active_seconds > total_seconds:
         active_seconds = total_seconds
@@ -660,6 +768,7 @@ def report_time_by_app(
     start: Optional[datetime] = None,
     end: Optional[datetime] = None,
     app_contains: Optional[str] = None,
+    exclude_inactive_session_afk: bool = False,
 ) -> Dict[str, Any]:
     start, end = _normalize_range(start, end)
     selected_device_ids = _normalize_device_ids(device_id=device_id, device_ids=device_ids)
@@ -671,6 +780,17 @@ def report_time_by_app(
         start=start,
         end=end,
     )
+    active_session_intervals = None
+    known_session_keys = None
+    if exclude_inactive_session_afk:
+        active_session_intervals, known_session_keys = _load_active_session_intervals(
+            api,
+            username=username,
+            device_id=device_id,
+            device_ids=selected_device_ids,
+            start=start,
+            end=end,
+        )
     rows: Dict[Tuple[str, str, str, str], Dict[str, float]] = defaultdict(
         lambda: {"seconds": 0.0, "active_seconds": 0.0, "afk_seconds": 0.0}
     )
@@ -699,6 +819,8 @@ def report_time_by_app(
                 start=start,
                 end=end,
                 afk_intervals=afk_intervals,
+                active_session_intervals=active_session_intervals,
+                known_session_keys=known_session_keys,
             )
             if seconds <= 0:
                 continue
@@ -733,6 +855,7 @@ def report_time_by_app(
             "device_id": device_id,
             "device_ids": selected_device_ids,
             "app_contains": app_contains,
+            "exclude_inactive_session_afk": exclude_inactive_session_afk,
             "start": _isoformat(start),
             "end": _isoformat(end),
         },
@@ -774,6 +897,7 @@ def summarize_user(
     start: Optional[datetime],
     end: Optional[datetime],
     device_ids: Optional[Iterable[str]] = None,
+    exclude_inactive_session_afk: bool = False,
 ) -> Dict[str, Any]:
     start, end = _normalize_range(start, end)
     live = summarize_live_state(api)
@@ -797,6 +921,16 @@ def summarize_user(
         for session in all_sessions
         if session["device_id"] in selected_device_set or not selected_device_ids
     ]
+    active_session_intervals = None
+    known_session_keys = None
+    if exclude_inactive_session_afk:
+        active_session_intervals, known_session_keys = _load_active_session_intervals(
+            api,
+            username=username,
+            device_ids=selected_device_ids,
+            start=start,
+            end=end,
+        )
 
     totals = {
         "active_seconds": _sum_bucket_event_seconds(
@@ -816,6 +950,8 @@ def summarize_user(
             start=start,
             end=end,
             predicate=lambda data: data.get("status") == "afk",
+            restrict_to_intervals_by_session=active_session_intervals,
+            restrict_known_sessions=known_session_keys,
         ),
         "locked_seconds": _sum_bucket_event_seconds(
             api,
@@ -852,6 +988,7 @@ def summarize_user(
         device_ids=selected_device_ids,
         start=start,
         end=end,
+        exclude_inactive_session_afk=exclude_inactive_session_afk,
     )
     apps_by_name: Dict[str, Dict[str, Any]] = {}
     for row in apps_report["rows"]:
@@ -887,6 +1024,9 @@ def summarize_user(
     return {
         "username": username,
         "range": {"start": _isoformat(start), "end": _isoformat(end)},
+        "filters": {
+            "exclude_inactive_session_afk": exclude_inactive_session_afk,
+        },
         "devices": sorted(available_device_catalog),
         "available_devices": [
             {"device_id": device_id, "device_name": device_name}
@@ -902,7 +1042,11 @@ def summarize_user(
 
 
 def summarize_device(
-    api, device_id: str, start: Optional[datetime], end: Optional[datetime]
+    api,
+    device_id: str,
+    start: Optional[datetime],
+    end: Optional[datetime],
+    exclude_inactive_session_afk: bool = False,
 ) -> Dict[str, Any]:
     start, end = _normalize_range(start, end)
     live = summarize_live_state(api)
@@ -911,6 +1055,15 @@ def summarize_device(
     )
     sessions = device["sessions"] if device else []
     users = sorted({session["username"] for session in sessions})
+    active_session_intervals = None
+    known_session_keys = None
+    if exclude_inactive_session_afk:
+        active_session_intervals, known_session_keys = _load_active_session_intervals(
+            api,
+            device_id=device_id,
+            start=start,
+            end=end,
+        )
 
     totals = {
         "active_seconds": _sum_bucket_event_seconds(
@@ -928,6 +1081,8 @@ def summarize_device(
             start=start,
             end=end,
             predicate=lambda data: data.get("status") == "afk",
+            restrict_to_intervals_by_session=active_session_intervals,
+            restrict_known_sessions=known_session_keys,
         ),
         "locked_seconds": _sum_bucket_event_seconds(
             api,
@@ -955,7 +1110,13 @@ def summarize_device(
         ),
     }
 
-    apps_report = report_time_by_app(api, device_id=device_id, start=start, end=end)
+    apps_report = report_time_by_app(
+        api,
+        device_id=device_id,
+        start=start,
+        end=end,
+        exclude_inactive_session_afk=exclude_inactive_session_afk,
+    )
     apps = [
         {
             "username": row["username"],
@@ -974,6 +1135,9 @@ def summarize_device(
         "status": device["status"] if device else "stale",
         "last_updated": device["last_updated"] if device else None,
         "range": {"start": _isoformat(start), "end": _isoformat(end)},
+        "filters": {
+            "exclude_inactive_session_afk": exclude_inactive_session_afk,
+        },
         "totals": totals,
         "apps": apps,
         "sessions": sessions,
@@ -995,6 +1159,9 @@ def run_report(api, report_spec: Dict[str, Any]) -> Dict[str, Any]:
             start=start,
             end=end,
             app_contains=filters.get("app_contains"),
+            exclude_inactive_session_afk=bool(
+                filters.get("exclude_inactive_session_afk")
+            ),
         )
 
     raise ValueError(f"Unknown fleet report '{report_name}'")
