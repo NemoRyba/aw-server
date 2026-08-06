@@ -778,6 +778,114 @@ def test_fleet_user_summary_unions_active_sessions_across_devices(flask_client):
             _delete_bucket(flask_client, bucket_id)
 
 
+def test_fleet_user_summary_reports_not_afk_active_session_time(flask_client):
+    suffix = str(random.randint(0, 10**6))
+    username = f"fleetnotafkactive-{suffix}"
+    devices = [
+        {
+            "device_id": f"pc-a-{suffix}",
+            "device_name": f"Host A {suffix}",
+            "session_id": "1",
+        },
+        {
+            "device_id": f"pc-b-{suffix}",
+            "device_name": f"Host B {suffix}",
+            "session_id": "2",
+        },
+    ]
+    bucket_ids = []
+    start = datetime(2026, 1, 1, 8, tzinfo=timezone.utc)
+    end = start + timedelta(hours=4)
+
+    try:
+        for device in devices:
+            metadata = {
+                "username": username,
+                "device_id": device["device_id"],
+                "device_name": device["device_name"],
+                "session_id": device["session_id"],
+                "session_type": "interactive",
+            }
+            session_bucket_id = (
+                f"aw-watcher-session__{device['device_id']}__"
+                f"{username}__{device['session_id']}"
+            )
+            afk_bucket_id = (
+                f"aw-watcher-afk__{device['device_id']}__"
+                f"{username}__{device['session_id']}"
+            )
+            bucket_ids.extend([session_bucket_id, afk_bucket_id])
+            _create_bucket(
+                flask_client,
+                session_bucket_id,
+                "sessionstate",
+                device["device_name"],
+                metadata,
+            )
+            _create_bucket(
+                flask_client,
+                afk_bucket_id,
+                "afkstatus",
+                device["device_name"],
+                metadata,
+            )
+
+        first_metadata = {
+            "username": username,
+            "device_id": devices[0]["device_id"],
+            "device_name": devices[0]["device_name"],
+            "session_id": devices[0]["session_id"],
+            "session_type": "interactive",
+        }
+        second_metadata = {
+            "username": username,
+            "device_id": devices[1]["device_id"],
+            "device_name": devices[1]["device_name"],
+            "session_id": devices[1]["session_id"],
+            "session_type": "interactive",
+        }
+
+        _create_event(
+            flask_client,
+            bucket_ids[0],
+            start,
+            7200,
+            {**first_metadata, "state": "active"},
+        )
+        _create_event(
+            flask_client,
+            bucket_ids[1],
+            start,
+            1800,
+            {**first_metadata, "status": "not-afk"},
+        )
+        _create_event(
+            flask_client,
+            bucket_ids[2],
+            start + timedelta(hours=1),
+            7200,
+            {**second_metadata, "state": "active"},
+        )
+        _create_event(
+            flask_client,
+            bucket_ids[3],
+            start + timedelta(hours=1, minutes=30),
+            3600,
+            {**second_metadata, "status": "not-afk"},
+        )
+
+        detail_r = flask_client.get(
+            f"/api/0/fleet/users/{username}?start={start.isoformat()}&end={end.isoformat()}"
+        )
+
+        assert detail_r.status_code == 200
+        assert detail_r.json["totals"]["active_seconds"] == 10800
+        assert detail_r.json["totals"]["not_afk_active_seconds"] == 5400
+    finally:
+        for bucket_id in bucket_ids:
+            _delete_bucket(flask_client, bucket_id)
+
+
 def test_fleet_user_summary_can_exclude_afk_outside_active_session(flask_client):
     suffix = str(random.randint(0, 10**6))
     username = f"fleetafksession-{suffix}"

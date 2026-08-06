@@ -1000,6 +1000,68 @@ def _session_state_totals(
     }
 
 
+def _intersect_intervals(
+    left: Iterable[Tuple[datetime, datetime]],
+    right: Iterable[Tuple[datetime, datetime]],
+) -> List[Tuple[datetime, datetime]]:
+    intersections: List[Tuple[datetime, datetime]] = []
+    right_intervals = list(right)
+    for left_start, left_end in left:
+        for right_start, right_end in right_intervals:
+            start = max(left_start, right_start)
+            end = min(left_end, right_end)
+            if end > start:
+                intersections.append((start, end))
+    return intersections
+
+
+def _not_afk_active_session_seconds(
+    api,
+    *,
+    username: Optional[str] = None,
+    device_id: Optional[str] = None,
+    device_ids: Optional[Iterable[str]] = None,
+    start: datetime,
+    end: datetime,
+) -> float:
+    active_session_intervals, known_session_keys = _load_active_session_intervals(
+        api,
+        username=username,
+        device_id=device_id,
+        device_ids=device_ids,
+        start=start,
+        end=end,
+    )
+    afk_intervals = _load_afk_intervals(
+        api,
+        username=username,
+        device_id=device_id,
+        device_ids=device_ids,
+        start=start,
+        end=end,
+    )
+
+    not_afk_active_intervals: List[Tuple[datetime, datetime]] = []
+    for session_key in known_session_keys:
+        session_active_intervals = active_session_intervals.get(session_key, [])
+        if not session_active_intervals:
+            continue
+
+        session_afk_intervals = afk_intervals.get(session_key)
+        if session_afk_intervals is None:
+            not_afk_active_intervals.extend(session_active_intervals)
+            continue
+
+        not_afk_active_intervals.extend(
+            _intersect_intervals(
+                session_active_intervals,
+                session_afk_intervals.get("not-afk", []),
+            )
+        )
+
+    return _sum_intervals(_merge_intervals(not_afk_active_intervals))
+
+
 def _window_event_breakdown(
     identity: Dict[str, Any],
     event: Dict[str, Any],
@@ -1235,6 +1297,13 @@ def summarize_user(
             predicate=lambda data: data.get("status") == "afk",
             restrict_to_intervals_by_session=active_session_intervals,
             restrict_known_sessions=known_session_keys,
+        ),
+        "not_afk_active_seconds": _not_afk_active_session_seconds(
+            api,
+            username=username,
+            device_ids=selected_device_ids,
+            start=start,
+            end=end,
         ),
     }
 
