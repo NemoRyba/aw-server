@@ -612,6 +612,47 @@ def _fleet_device_ids():
     return unique
 
 
+def _fleet_json_date(data, key: str):
+    value = data.get(key)
+    if not value:
+        return None
+    return _parse_query_date(str(value))
+
+
+def _fleet_json_device_ids(data):
+    value = data.get("device_ids")
+    if value is None:
+        value = data.get("device_id")
+    if value is None:
+        return None
+    values = value if isinstance(value, list) else [value]
+    device_ids = []
+    for item in values:
+        for part in str(item).split(","):
+            part = part.strip()
+            if part:
+                device_ids.append(part)
+    if not device_ids:
+        return None
+    unique = []
+    seen = set()
+    for device_id in device_ids:
+        if device_id in seen:
+            continue
+        seen.add(device_id)
+        unique.append(device_id)
+    return unique
+
+
+def _fleet_json_bool(data, key: str, default: bool = False) -> bool:
+    if key not in data:
+        return default
+    value = data.get(key)
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _fleet_bool_arg(name: str, default: bool = False) -> bool:
     if name not in request.args:
         return default
@@ -650,6 +691,50 @@ class FleetUsersResource(Resource):
         return jsonify(current_app.api.get_fleet_users())
 
 
+@api.route("/0/fleet/summary")
+class FleetSummaryResource(Resource):
+    def get(self):
+        start, end = _fleet_range()
+        return jsonify(
+            current_app.api.get_fleet_summary(
+                start=start,
+                end=end,
+                exclude_inactive_session_afk=_fleet_bool_arg(
+                    "exclude_inactive_session_afk", True
+                ),
+            )
+        )
+
+
+@api.route("/0/fleet/summary/precompute/config")
+class FleetSummaryPrecomputeConfigResource(Resource):
+    def get(self):
+        return jsonify(current_app.api.get_fleet_summary_precompute_config())
+
+    def post(self):
+        return jsonify(
+            current_app.api.set_fleet_summary_precompute_config(
+                request.get_json() or {}
+            )
+        )
+
+
+@api.route("/0/fleet/summary/precompute")
+class FleetSummaryPrecomputeResource(Resource):
+    def post(self):
+        data = request.get_json() or {}
+        return jsonify(
+            current_app.api.precompute_fleet_user_summaries(
+                start=_fleet_json_date(data, "start"),
+                end=_fleet_json_date(data, "end"),
+                usernames=data.get("usernames"),
+                force=_fleet_json_bool(data, "force", True),
+                source="manual",
+                start_of_day=data.get("start_of_day") or data.get("startOfDay"),
+            )
+        )
+
+
 @api.route("/0/fleet/users/<string:username>")
 class FleetUserResource(Resource):
     def get(self, username: str):
@@ -662,6 +747,23 @@ class FleetUserResource(Resource):
                 device_ids=_fleet_device_ids(),
                 exclude_inactive_session_afk=_fleet_bool_arg(
                     "exclude_inactive_session_afk"
+                ),
+            )
+        )
+
+
+@api.route("/0/fleet/users/<string:username>/summary/recalculate")
+class FleetUserSummaryRecalculateResource(Resource):
+    def post(self, username: str):
+        data = request.get_json() or {}
+        return jsonify(
+            current_app.api.recalculate_fleet_user_summary(
+                username,
+                start=_fleet_json_date(data, "start"),
+                end=_fleet_json_date(data, "end"),
+                device_ids=_fleet_json_device_ids(data),
+                exclude_inactive_session_afk=_fleet_json_bool(
+                    data, "exclude_inactive_session_afk", True
                 ),
             )
         )

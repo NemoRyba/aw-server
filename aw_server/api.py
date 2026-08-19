@@ -2,12 +2,14 @@ import functools
 import json
 import logging
 import shutil
-from datetime import datetime
+import threading
+from datetime import datetime, timedelta
 from pathlib import Path
 from socket import gethostname
 from typing import (
     Any,
     Dict,
+    Iterable,
     List,
     Optional,
 )
@@ -23,9 +25,12 @@ from aw_transform import heartbeat_merge
 from .__about__ import __version__
 from .exceptions import NotFound
 from .fleet import (
+    calculate_user_summary_totals,
+    format_fleet_datetime,
     get_bucket_identity,
     group_buckets_by_device,
     group_buckets_by_user,
+    normalize_fleet_range,
     run_report,
     summarize_device,
     summarize_device_metrics,
@@ -36,9 +41,31 @@ from .fleet import (
 )
 from .fleet_sync import sync_batch, sync_handshake
 from .fleet_sync_store import FleetSyncStore
+from .fleet_summary_store import FleetSummaryStore
 from .settings import Settings
 
 logger = logging.getLogger(__name__)
+
+FLEET_SUMMARY_PRECOMPUTE_CONFIG_KEY = "fleetSummaryPrecomputeConfig"
+DEFAULT_FLEET_SUMMARY_PRECOMPUTE_CONFIG = {
+    "auto_enabled": False,
+    "start_of_day": "04:00",
+}
+
+
+def _normalize_time_of_day(value: Any, default: str = "04:00") -> str:
+    text = str(value or default).strip()
+    parts = text.split(":")
+    if len(parts) < 2:
+        return default
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1])
+    except (TypeError, ValueError):
+        return default
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        return default
+    return f"{hour:02d}:{minute:02d}"
 
 
 def get_device_id() -> str:
@@ -82,8 +109,14 @@ class ServerAPI:
         self.db = db
         self.settings = Settings(testing)
         self.sync_store = FleetSyncStore(testing=testing)
+        self.summary_store = FleetSummaryStore(testing=testing)
         self.testing = testing
         self.last_event = {}  # type: dict
+        self._summary_precompute_lock = threading.Lock()
+        self._summary_precompute_stop = threading.Event()
+        self._summary_precompute_thread = None
+        if not testing:
+            self._start_summary_precompute_worker()
 
     def get_info(self) -> Dict[str, Any]:
         """Get server info"""
@@ -436,6 +469,260 @@ class ServerAPI:
             self.settings[key] = value
         return value
 
+    def _normalize_fleet_summary_precompute_config(self, value=None):
+        config = dict(DEFAULT_FLEET_SUMMARY_PRECOMPUTE_CONFIG)
+        if isinstance(value, dict):
+            config["auto_enabled"] = bool(value.get("auto_enabled", False))
+            config["start_of_day"] = _normalize_time_of_day(
+                value.get("start_of_day") or value.get("startOfDay"),
+                config["start_of_day"],
+            )
+        return config
+
+    def get_fleet_summary_precompute_config(self):
+        config = self._normalize_fleet_summary_precompute_config(
+            self.settings.get(FLEET_SUMMARY_PRECOMPUTE_CONFIG_KEY, None)
+        )
+        return {
+            **config,
+            "runs": self.summary_store.latest_precompute_runs(limit=10),
+        }
+
+    def set_fleet_summary_precompute_config(self, value):
+        config = self._normalize_fleet_summary_precompute_config(value)
+        self.settings[FLEET_SUMMARY_PRECOMPUTE_CONFIG_KEY] = config
+        return self.get_fleet_summary_precompute_config()
+
+    def _start_summary_precompute_worker(self):
+        self._summary_precompute_thread = threading.Thread(
+            target=self._summary_precompute_loop,
+            name="fleet-summary-precompute",
+            daemon=True,
+        )
+        self._summary_precompute_thread.start()
+
+    def _summary_precompute_loop(self):
+        while not self._summary_precompute_stop.wait(60):
+            try:
+                self.maybe_auto_precompute_fleet_summary()
+            except Exception:
+                logger.exception("Fleet summary auto precompute failed")
+
+    def _previous_summary_period(self, start_of_day: str):
+        hour, minute = [int(part) for part in start_of_day.split(":", 1)]
+        now = datetime.now().astimezone()
+        boundary = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if now < boundary:
+            boundary -= timedelta(days=1)
+        return boundary - timedelta(days=1), boundary
+
+    def maybe_auto_precompute_fleet_summary(self):
+        config = self.get_fleet_summary_precompute_config()
+        if not config["auto_enabled"]:
+            return None
+
+        start, end = self._previous_summary_period(config["start_of_day"])
+        start, end = normalize_fleet_range(start, end)
+        range_start = format_fleet_datetime(start)
+        range_end = format_fleet_datetime(end)
+        run_key = f"auto:{range_start}:{range_end}:{config['start_of_day']}"
+        previous_run = self.summary_store.get_precompute_run(run_key)
+        if previous_run and previous_run.get("status") == "completed":
+            return previous_run
+
+        return self.precompute_fleet_user_summaries(
+            start=start,
+            end=end,
+            force=False,
+            source="auto",
+            run_key=run_key,
+            start_of_day=config["start_of_day"],
+        )
+
+    def get_fleet_user_summary_value(
+        self,
+        username,
+        start=None,
+        end=None,
+        device_ids: Optional[Iterable[Any]] = None,
+        exclude_inactive_session_afk=True,
+        force=False,
+        source="on_demand",
+    ):
+        start, end = normalize_fleet_range(start, end)
+        range_start = format_fleet_datetime(start)
+        range_end = format_fleet_datetime(end)
+        cached = None
+        if not force:
+            cached = self.summary_store.get_user_summary(
+                username=username,
+                range_start=range_start,
+                range_end=range_end,
+                device_ids=device_ids,
+                exclude_inactive_session_afk=exclude_inactive_session_afk,
+            )
+        if cached:
+            return cached
+
+        summary = calculate_user_summary_totals(
+            self,
+            username,
+            start,
+            end,
+            device_ids=device_ids,
+            exclude_inactive_session_afk=exclude_inactive_session_afk,
+        )
+        return self.summary_store.upsert_user_summary(
+            username=username,
+            range_start=summary["range"]["start"],
+            range_end=summary["range"]["end"],
+            device_ids=device_ids,
+            exclude_inactive_session_afk=exclude_inactive_session_afk,
+            selected_devices=summary["selected_devices"],
+            totals=summary["totals"],
+            source=source,
+        )
+
+    def recalculate_fleet_user_summary(
+        self,
+        username,
+        start=None,
+        end=None,
+        device_ids: Optional[Iterable[Any]] = None,
+        exclude_inactive_session_afk=True,
+    ):
+        return self.get_fleet_user_summary_value(
+            username,
+            start=start,
+            end=end,
+            device_ids=device_ids,
+            exclude_inactive_session_afk=exclude_inactive_session_afk,
+            force=True,
+            source="manual",
+        )
+
+    def get_fleet_summary(
+        self,
+        start=None,
+        end=None,
+        exclude_inactive_session_afk=True,
+    ):
+        start, end = normalize_fleet_range(start, end)
+        users = self.get_fleet_users()["users"]
+        rows = []
+        for user in users:
+            summary = self.get_fleet_user_summary_value(
+                user["username"],
+                start=start,
+                end=end,
+                exclude_inactive_session_afk=exclude_inactive_session_afk,
+            )
+            rows.append(
+                {
+                    **user,
+                    "totals": summary["totals"],
+                    "summary_cache": summary["summary_cache"],
+                    "selected_devices": summary["selected_devices"],
+                }
+            )
+
+        return {
+            "generated_at": datetime.now().astimezone().isoformat(),
+            "range": {
+                "start": format_fleet_datetime(start),
+                "end": format_fleet_datetime(end),
+            },
+            "filters": {
+                "exclude_inactive_session_afk": exclude_inactive_session_afk,
+            },
+            "users": rows,
+        }
+
+    def precompute_fleet_user_summaries(
+        self,
+        start=None,
+        end=None,
+        usernames: Optional[Iterable[str]] = None,
+        force=True,
+        source="manual",
+        run_key=None,
+        start_of_day=None,
+    ):
+        if not self._summary_precompute_lock.acquire(blocking=False):
+            return {
+                "status": "busy",
+                "message": "A fleet summary precompute is already running.",
+                "runs": self.summary_store.latest_precompute_runs(limit=10),
+            }
+
+        try:
+            start, end = normalize_fleet_range(start, end)
+            range_start = format_fleet_datetime(start)
+            range_end = format_fleet_datetime(end)
+            config = self.get_fleet_summary_precompute_config()
+            start_of_day = _normalize_time_of_day(
+                start_of_day or config["start_of_day"],
+                config["start_of_day"],
+            )
+            user_rows = self.get_fleet_users()["users"]
+            if usernames is None:
+                selected_usernames = [row["username"] for row in user_rows]
+            else:
+                selected_usernames = sorted(
+                    {
+                        str(username).strip()
+                        for username in usernames
+                        if str(username).strip()
+                    }
+                )
+            run_key = run_key or f"{source}:{range_start}:{range_end}:{uuid4()}"
+            self.summary_store.start_precompute_run(
+                run_key=run_key,
+                range_start=range_start,
+                range_end=range_end,
+                start_of_day=start_of_day,
+                source=source,
+                users_total=len(selected_usernames),
+            )
+
+            errors = []
+            users_done = 0
+            for username in selected_usernames:
+                try:
+                    self.get_fleet_user_summary_value(
+                        username,
+                        start=start,
+                        end=end,
+                        exclude_inactive_session_afk=True,
+                        force=force,
+                        source=source,
+                    )
+                except Exception as exc:
+                    logger.exception(
+                        "Unable to precompute fleet summary for user %s", username
+                    )
+                    errors.append(f"{username}: {exc}")
+                users_done += 1
+                self.summary_store.update_precompute_progress(run_key, users_done)
+
+            status = "completed" if not errors else "completed_with_errors"
+            message = "; ".join(errors[:5])
+            run = self.summary_store.finish_precompute_run(
+                run_key=run_key,
+                status=status,
+                message=message,
+            )
+            return {
+                "status": status,
+                "run": run,
+                "users_total": len(selected_usernames),
+                "users_done": users_done,
+                "errors": errors,
+                "runs": self.summary_store.latest_precompute_runs(limit=10),
+            }
+        finally:
+            self._summary_precompute_lock.release()
+
     def get_bucket_identity(self, bucket):
         return get_bucket_identity(bucket)
 
@@ -473,7 +760,14 @@ class ServerAPI:
         device_ids=None,
         exclude_inactive_session_afk=False,
     ):
-        return summarize_user(
+        summary = self.get_fleet_user_summary_value(
+            username,
+            start=start,
+            end=end,
+            device_ids=device_ids,
+            exclude_inactive_session_afk=exclude_inactive_session_afk,
+        )
+        detail = summarize_user(
             self,
             username,
             start,
@@ -481,6 +775,9 @@ class ServerAPI:
             device_ids=device_ids,
             exclude_inactive_session_afk=exclude_inactive_session_afk,
         )
+        detail["totals"] = summary["totals"]
+        detail["summary_cache"] = summary["summary_cache"]
+        return detail
 
     def get_fleet_devices(self):
         return summarize_devices(self)

@@ -37,6 +37,16 @@ def _isoformat(value: Optional[datetime]) -> Optional[str]:
     return value.astimezone(timezone.utc).isoformat()
 
 
+def format_fleet_datetime(value: Optional[datetime]) -> Optional[str]:
+    return _isoformat(value)
+
+
+def normalize_fleet_range(
+    start: Optional[datetime], end: Optional[datetime]
+) -> Tuple[datetime, datetime]:
+    return _normalize_range(start, end)
+
+
 def _coerce_seconds(value: Any) -> float:
     if value is None:
         return 0.0
@@ -471,6 +481,29 @@ def group_buckets_by_device(api) -> Dict[str, List[Dict[str, Any]]]:
 def summarize_users(api) -> Dict[str, Any]:
     live = summarize_live_state(api)
     users: Dict[str, Dict[str, Any]] = {}
+
+    for bucket in api.get_buckets().values():
+        classification = classify_bucket(bucket)
+        if classification is None:
+            continue
+
+        user = users.setdefault(
+            classification["username"],
+            {
+                "username": classification["username"],
+                "devices": set(),
+                "last_seen": None,
+                "active_sessions": 0,
+            },
+        )
+        user["devices"].add(classification["device_id"])
+        last_updated = _parse_datetime(
+            bucket.get("last_updated") or bucket.get("created")
+        )
+        if user["last_seen"] is None or (
+            last_updated is not None and last_updated > user["last_seen"]
+        ):
+            user["last_seen"] = last_updated
 
     for session in live["users"]:
         user = users.setdefault(
@@ -1286,17 +1319,14 @@ def _collect_user_device_catalog(
     return devices
 
 
-def summarize_user(
+def _resolve_user_device_selection(
     api,
+    *,
     username: str,
-    start: Optional[datetime],
-    end: Optional[datetime],
+    start: datetime,
+    end: datetime,
     device_ids: Optional[Iterable[str]] = None,
-    exclude_inactive_session_afk: bool = False,
-) -> Dict[str, Any]:
-    start, end = _normalize_range(start, end)
-    live = summarize_live_state(api)
-    all_sessions = [session for session in live["users"] if session["username"] == username]
+) -> Tuple[Dict[str, str], List[str]]:
     available_device_catalog = _collect_user_device_catalog(
         api,
         username=username,
@@ -1310,12 +1340,37 @@ def summarize_user(
         for device_id in selected_device_ids:
             available_device_catalog.setdefault(device_id, device_id)
 
-    selected_device_set = set(selected_device_ids)
-    sessions = [
-        session
-        for session in all_sessions
-        if session["device_id"] in selected_device_set or not selected_device_ids
+    return available_device_catalog, selected_device_ids
+
+
+def _user_available_devices_payload(
+    available_device_catalog: Dict[str, str],
+) -> List[Dict[str, str]]:
+    return [
+        {"device_id": device_id, "device_name": device_name}
+        for device_id, device_name in sorted(
+            available_device_catalog.items(), key=lambda item: item[1] or item[0]
+        )
     ]
+
+
+def calculate_user_summary_totals(
+    api,
+    username: str,
+    start: Optional[datetime],
+    end: Optional[datetime],
+    device_ids: Optional[Iterable[str]] = None,
+    exclude_inactive_session_afk: bool = False,
+) -> Dict[str, Any]:
+    start, end = _normalize_range(start, end)
+    available_device_catalog, selected_device_ids = _resolve_user_device_selection(
+        api,
+        username=username,
+        start=start,
+        end=end,
+        device_ids=device_ids,
+    )
+
     active_session_intervals = None
     known_session_keys = None
     if exclude_inactive_session_afk:
@@ -1354,6 +1409,51 @@ def summarize_user(
             end=end,
         ),
     }
+
+    return {
+        "username": username,
+        "range": {"start": _isoformat(start), "end": _isoformat(end)},
+        "filters": {
+            "exclude_inactive_session_afk": exclude_inactive_session_afk,
+        },
+        "devices": sorted(available_device_catalog),
+        "available_devices": _user_available_devices_payload(available_device_catalog),
+        "selected_devices": sorted(selected_device_ids),
+        "totals": totals,
+    }
+
+
+def summarize_user(
+    api,
+    username: str,
+    start: Optional[datetime],
+    end: Optional[datetime],
+    device_ids: Optional[Iterable[str]] = None,
+    exclude_inactive_session_afk: bool = False,
+) -> Dict[str, Any]:
+    start, end = _normalize_range(start, end)
+    live = summarize_live_state(api)
+    all_sessions = [session for session in live["users"] if session["username"] == username]
+    summary = calculate_user_summary_totals(
+        api,
+        username,
+        start,
+        end,
+        device_ids=device_ids,
+        exclude_inactive_session_afk=exclude_inactive_session_afk,
+    )
+    available_device_catalog = {
+        device["device_id"]: device["device_name"]
+        for device in summary["available_devices"]
+    }
+    selected_device_ids = list(summary["selected_devices"])
+
+    selected_device_set = set(selected_device_ids)
+    sessions = [
+        session
+        for session in all_sessions
+        if session["device_id"] in selected_device_set or not selected_device_ids
+    ]
 
     apps_report = report_time_by_app(
         api,
@@ -1408,7 +1508,7 @@ def summarize_user(
             )
         ],
         "selected_devices": sorted(selected_device_ids),
-        "totals": totals,
+        "totals": summary["totals"],
         "apps": apps,
         "sessions": sessions,
     }
