@@ -580,6 +580,24 @@ class AdminAuthUserResource(Resource):
         return jsonify(user)
 
 
+@api.route("/0/admin/redmine")
+class AdminRedmineResource(Resource):
+    def get(self):
+        _require_builtin_admin_user()
+        return jsonify(current_app.api.get_redmine_config())
+
+    def post(self):
+        _require_builtin_admin_user()
+        return jsonify(current_app.api.set_redmine_config(request.get_json() or {}))
+
+
+@api.route("/0/admin/redmine/test")
+class AdminRedmineTestResource(Resource):
+    def post(self):
+        _require_builtin_admin_user()
+        return jsonify(current_app.api.test_redmine_config(request.get_json() or {}))
+
+
 # FLEET
 
 
@@ -731,6 +749,19 @@ class FleetSummaryPrecomputeResource(Resource):
                 force=_fleet_json_bool(data, "force", True),
                 source="manual",
                 start_of_day=data.get("start_of_day") or data.get("startOfDay"),
+            )
+        )
+
+
+@api.route("/0/fleet/redmine-comparison")
+class FleetRedmineComparisonResource(Resource):
+    def post(self):
+        data = request.get_json() or {}
+        return jsonify(
+            current_app.api.get_fleet_redmine_comparison(
+                start=_fleet_json_date(data, "start"),
+                end=_fleet_json_date(data, "end"),
+                usernames=data.get("usernames") or [],
             )
         )
 

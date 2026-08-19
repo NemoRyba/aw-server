@@ -3,6 +3,7 @@ import json
 import logging
 import shutil
 import threading
+from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 from socket import gethostname
@@ -42,6 +43,12 @@ from .fleet import (
 from .fleet_sync import sync_batch, sync_handshake
 from .fleet_sync_store import FleetSyncStore
 from .fleet_summary_store import FleetSummaryStore
+from .redmine import (
+    RedmineReadOnlyError,
+    RedmineReadOnlySource,
+    normalize_email,
+    redmine_spent_on_range,
+)
 from .settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -468,6 +475,189 @@ class ServerAPI:
         else:
             self.settings[key] = value
         return value
+
+    def get_redmine_config(self):
+        return self.settings.get_redmine_config(include_secret=False)
+
+    def set_redmine_config(self, value):
+        return self.settings.set_redmine_config(value)
+
+    def test_redmine_config(self, value=None):
+        config = self.settings._normalize_redmine_config(
+            value or self.settings.get_redmine_config(include_secret=True),
+            previous=self.settings.get_redmine_config(include_secret=True),
+        )
+        if not config.get("enabled"):
+            return {"ok": False, "message": "Redmine integration is disabled"}
+        try:
+            users = RedmineReadOnlySource(config).active_users(limit=1)
+            return {
+                "ok": True,
+                "message": "Redmine read-only query succeeded",
+                "sample_users": len(users),
+            }
+        except Exception as error:
+            logger.warning("Redmine read-only query test failed: %s", error)
+            return {"ok": False, "message": str(error)}
+
+    def get_fleet_redmine_comparison(self, start=None, end=None, usernames=None):
+        start, end = normalize_fleet_range(start, end)
+        selected_usernames = [
+            str(username).strip()
+            for username in (usernames or [])
+            if str(username).strip()
+        ]
+        config = self.settings.get_redmine_config(include_secret=True)
+        public_config = self.settings.get_redmine_config(include_secret=False)
+
+        payload = {
+            "generated_at": datetime.now().astimezone().isoformat(),
+            "enabled": bool(config.get("enabled")),
+            "range": {
+                "start": format_fleet_datetime(start),
+                "end": format_fleet_datetime(end),
+            },
+            "spent_on_range": None,
+            "users": [],
+            "totals": {
+                "redmine_hours": 0.0,
+                "redmine_seconds": 0.0,
+            },
+            "config": {
+                "driver": public_config.get("driver"),
+                "host": public_config.get("host"),
+                "database": public_config.get("database"),
+            },
+        }
+        if not config.get("enabled"):
+            payload["message"] = "Redmine integration is disabled"
+            return payload
+        if not selected_usernames:
+            return payload
+
+        spent_from, spent_to = redmine_spent_on_range(start, end)
+        payload["spent_on_range"] = {
+            "from": spent_from.isoformat(),
+            "to": spent_to.isoformat(),
+        }
+
+        profiles = {
+            username: self.settings.lookup_ldap_user_profile(username)
+            for username in selected_usernames
+        }
+
+        try:
+            source = RedmineReadOnlySource(config)
+            redmine_users = source.active_users()
+            redmine_users_by_email = {
+                normalize_email(user.get("mail")): user
+                for user in redmine_users
+                if normalize_email(user.get("mail"))
+            }
+
+            matched_by_username = {}
+            for username, profile in profiles.items():
+                redmine_user = redmine_users_by_email.get(
+                    normalize_email(profile.get("email"))
+                )
+                if redmine_user:
+                    matched_by_username[username] = redmine_user
+
+            project_rows = source.time_by_project(
+                user_ids=[user["id"] for user in matched_by_username.values()],
+                spent_from=spent_from,
+                spent_to=spent_to,
+            )
+        except (RedmineReadOnlyError, RuntimeError) as error:
+            payload["error"] = str(error)
+            payload["users"] = [
+                self._redmine_unmatched_user_payload(username, profiles[username])
+                for username in selected_usernames
+            ]
+            return payload
+
+        projects_by_user_id = defaultdict(list)
+        hours_by_user_id = defaultdict(float)
+        entry_count_by_user_id = defaultdict(int)
+        for row in project_rows:
+            user_id = int(row.get("user_id") or 0)
+            hours = float(row.get("hours") or 0.0)
+            entry_count = int(row.get("entry_count") or 0)
+            hours_by_user_id[user_id] += hours
+            entry_count_by_user_id[user_id] += entry_count
+            projects_by_user_id[user_id].append(
+                {
+                    "project_id": row.get("project_id"),
+                    "project_name": row.get("project_name") or "",
+                    "hours": hours,
+                    "seconds": hours * 3600.0,
+                    "entry_count": entry_count,
+                }
+            )
+
+        rows = []
+        total_hours = 0.0
+        for username in selected_usernames:
+            profile = profiles[username]
+            redmine_user = matched_by_username.get(username)
+            if not redmine_user:
+                rows.append(self._redmine_unmatched_user_payload(username, profile))
+                continue
+
+            user_id = int(redmine_user["id"])
+            hours = float(hours_by_user_id.get(user_id, 0.0))
+            total_hours += hours
+            rows.append(
+                {
+                    "username": username,
+                    "email": profile.get("email") or "",
+                    "display_name": profile.get("display_name") or "",
+                    "ldap_source": profile.get("source") or "",
+                    "matched": True,
+                    "status": "matched",
+                    "redmine_user_id": user_id,
+                    "redmine_login": redmine_user.get("login") or "",
+                    "redmine_name": " ".join(
+                        part
+                        for part in (
+                            redmine_user.get("firstname"),
+                            redmine_user.get("lastname"),
+                        )
+                        if part
+                    ),
+                    "redmine_hours": hours,
+                    "redmine_seconds": hours * 3600.0,
+                    "entry_count": int(entry_count_by_user_id.get(user_id, 0)),
+                    "projects": projects_by_user_id.get(user_id, []),
+                }
+            )
+
+        payload["users"] = rows
+        payload["totals"] = {
+            "redmine_hours": total_hours,
+            "redmine_seconds": total_hours * 3600.0,
+        }
+        return payload
+
+    def _redmine_unmatched_user_payload(self, username, profile):
+        status = "missing_email"
+        if profile.get("email"):
+            status = "no_redmine_user"
+        return {
+            "username": username,
+            "email": profile.get("email") or "",
+            "display_name": profile.get("display_name") or "",
+            "ldap_source": profile.get("source") or "",
+            "matched": False,
+            "status": status,
+            "redmine_user_id": None,
+            "redmine_login": "",
+            "redmine_name": "",
+            "redmine_hours": None,
+            "redmine_seconds": None,
+            "entry_count": 0,
+            "projects": [],
+        }
 
     def _normalize_fleet_summary_precompute_config(self, value=None):
         config = dict(DEFAULT_FLEET_SUMMARY_PRECOMPUTE_CONFIG)

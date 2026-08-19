@@ -17,6 +17,7 @@ class Settings:
     SESSION_SECRET_KEY = "_session_secret"
     ADMIN_UI_CONFIG_KEY = "_admin_ui_config"
     LDAP_CONFIG_KEY = "_ldap_config"
+    REDMINE_CONFIG_KEY = "_redmine_config"
     PASSWORD_HASH_KEY = "password_hash"
     LEGACY_PASSWORD_KEY = "password"
     LOCAL_AUTH_SOURCE = "local"
@@ -34,12 +35,25 @@ class Settings:
         "bind_password": "",
         "user_search_filter": "(&(objectClass=user)(|(sAMAccountName={username})(userPrincipalName={raw_username})(userPrincipalName={upn})))",
     }
+    DEFAULT_REDMINE_CONFIG = {
+        "enabled": False,
+        "driver": "auto",
+        "host": "",
+        "port": 3306,
+        "database": "redmine",
+        "username": "",
+        "password": "",
+        "table_prefix": "",
+        "mysql_cli_path": "mysql",
+        "connect_timeout": 10,
+    }
     RESERVED_KEYS = {
         AUTH_USERS_KEY,
         USER_PROFILES_KEY,
         SESSION_SECRET_KEY,
         ADMIN_UI_CONFIG_KEY,
         LDAP_CONFIG_KEY,
+        REDMINE_CONFIG_KEY,
     }
 
     def __init__(self, testing: bool):
@@ -168,6 +182,48 @@ class Settings:
         public_config["bind_password_present"] = bool(config.get("bind_password"))
         return public_config
 
+    def _normalize_redmine_config(self, value, previous=None):
+        config = dict(self.DEFAULT_REDMINE_CONFIG)
+        previous = previous if isinstance(previous, dict) else {}
+        if previous.get("password"):
+            config["password"] = str(previous.get("password") or "")
+        if isinstance(value, dict):
+            keep_existing_password = bool(value.get("password_present"))
+            for key in self.DEFAULT_REDMINE_CONFIG:
+                if key not in value:
+                    continue
+                if key == "enabled":
+                    config[key] = bool(value[key])
+                elif key == "port":
+                    try:
+                        config[key] = int(value[key])
+                    except (TypeError, ValueError):
+                        config[key] = self.DEFAULT_REDMINE_CONFIG[key]
+                elif key == "connect_timeout":
+                    try:
+                        config[key] = max(1, min(120, int(value[key])))
+                    except (TypeError, ValueError):
+                        config[key] = self.DEFAULT_REDMINE_CONFIG[key]
+                elif key == "password" and (
+                    value.get(key) in (None, "") or keep_existing_password
+                ):
+                    config[key] = str(previous.get(key) or "")
+                elif key == "password":
+                    config[key] = str(value[key] or "")
+                else:
+                    config[key] = str(value[key] or "").strip()
+            if value.get("clear_password"):
+                config["password"] = ""
+        return config
+
+    def _public_redmine_config(self, config=None):
+        config = self._normalize_redmine_config(
+            self.data.get(self.REDMINE_CONFIG_KEY) if config is None else config
+        )
+        public_config = {key: value for key, value in config.items() if key != "password"}
+        public_config["password_present"] = bool(config.get("password"))
+        return public_config
+
     def _public_auth_user(self, username, user):
         user = user if isinstance(user, dict) else {}
         return {
@@ -277,6 +333,22 @@ class Settings:
         self.save()
         return self._public_ldap_config(config)
 
+    def get_redmine_config(self, include_secret=False):
+        config = self._normalize_redmine_config(self.data.get(self.REDMINE_CONFIG_KEY))
+        if self.data.get(self.REDMINE_CONFIG_KEY) != config:
+            self.data[self.REDMINE_CONFIG_KEY] = config
+            self.save()
+        if include_secret:
+            return dict(config)
+        return self._public_redmine_config(config)
+
+    def set_redmine_config(self, value):
+        previous = self.data.get(self.REDMINE_CONFIG_KEY)
+        config = self._normalize_redmine_config(value, previous=previous)
+        self.data[self.REDMINE_CONFIG_KEY] = config
+        self.save()
+        return self._public_redmine_config(config)
+
     def test_ldap_config(self, value=None, username="", password=""):
         previous = self.data.get(self.LDAP_CONFIG_KEY)
         config = self._normalize_ldap_config(value or previous, previous=previous)
@@ -297,6 +369,52 @@ class Settings:
         except Exception as error:
             logger.warning("LDAP service bind test failed: %s", error)
             return {"ok": False, "message": str(error)}
+
+    def lookup_ldap_user_profile(self, username: str):
+        normalized = self._normalize_lookup_username(username)
+        profile = {
+            "username": normalized,
+            "raw_username": str(username or "").strip(),
+            "display_name": "",
+            "email": "",
+            "source": "unknown",
+        }
+
+        cached_user = self.get_auth_user(normalized) or self.get_auth_user(username)
+        if isinstance(cached_user, dict):
+            profile.update(
+                {
+                    "display_name": str(cached_user.get("display_name") or ""),
+                    "email": str(cached_user.get("email") or "").strip(),
+                    "source": str(cached_user.get("source") or "cached"),
+                }
+            )
+
+        config = self._ldap_config_for_auth()
+        if not config:
+            return profile
+
+        connection = None
+        try:
+            connection = self._ldap_service_connection(config)
+            search_result = self._ldap_search_user(connection, config, username)
+            if not search_result:
+                return profile
+            _dn, attrs = search_result
+            profile.update(
+                {
+                    "username": self._canonical_ldap_username(username, attrs),
+                    "display_name": self._first_ldap_attr(attrs, "displayName"),
+                    "email": self._first_ldap_attr(attrs, "mail"),
+                    "source": "ldap",
+                }
+            )
+        except Exception as error:
+            logger.warning("LDAP profile lookup failed for %s: %s", username, error)
+        finally:
+            if connection is not None:
+                connection.unbind()
+        return profile
 
     def _ldap_config_for_auth(self):
         config = self._normalize_ldap_config(self.data.get(self.LDAP_CONFIG_KEY))
