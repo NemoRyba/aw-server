@@ -273,6 +273,18 @@ def _is_expired_terminal_session(session: Dict[str, Any], now: datetime) -> bool
     return now - last_updated > LIVE_TERMINAL_SESSION_RETENTION
 
 
+def _is_recent_live_update(value: Optional[datetime], now: datetime) -> bool:
+    return value is not None and now - value <= LIVE_STALE_AFTER
+
+
+def _is_newer_update(
+    current: Optional[datetime], candidate: Optional[datetime]
+) -> bool:
+    if current is None:
+        return True
+    return candidate is not None and candidate >= current
+
+
 def summarize_live_state(api) -> Dict[str, Any]:
     snapshots = _load_live_snapshots(api)
     sessions: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
@@ -299,6 +311,9 @@ def summarize_live_state(api) -> Dict[str, Any]:
                 "process_path": None,
                 "explorer_path": None,
                 "_last_updated_dt": None,
+                "_session_updated_dt": None,
+                "_afk_updated_dt": None,
+                "_window_updated_dt": None,
             },
         )
 
@@ -309,12 +324,21 @@ def summarize_live_state(api) -> Dict[str, Any]:
         ):
             session["_last_updated_dt"] = updated
 
-        if snapshot["kind"] == "session":
+        if snapshot["kind"] == "session" and _is_newer_update(
+            session["_session_updated_dt"], updated
+        ):
+            session["_session_updated_dt"] = updated
             session["session_state"] = data.get("state") or session["session_state"]
             session["session_reason"] = data.get("reason") or session["session_reason"]
-        elif snapshot["kind"] == "afk":
+        elif snapshot["kind"] == "afk" and _is_newer_update(
+            session["_afk_updated_dt"], updated
+        ):
+            session["_afk_updated_dt"] = updated
             session["afk_status"] = data.get("status") or session["afk_status"]
-        elif snapshot["kind"] == "window":
+        elif snapshot["kind"] == "window" and _is_newer_update(
+            session["_window_updated_dt"], updated
+        ):
+            session["_window_updated_dt"] = updated
             session["current_app"] = data.get("app") or session["current_app"]
             session["current_title"] = data.get("title") or session["current_title"]
             session["process_name"] = data.get("process_name") or session["process_name"]
@@ -324,6 +348,30 @@ def summarize_live_state(api) -> Dict[str, Any]:
     now = _utcnow()
     session_rows = []
     for session in sessions.values():
+        session_update = session.pop("_session_updated_dt")
+        afk_update = session.pop("_afk_updated_dt")
+        window_update = session.pop("_window_updated_dt")
+        session_has_state = session.get("session_state") is not None
+        session_state_is_recent = _is_recent_live_update(session_update, now)
+        session_state = session.get("session_state")
+
+        if session_has_state and not session_state_is_recent:
+            if session_state not in LIVE_TERMINAL_STATES:
+                continue
+        if not session_has_state and not _is_recent_live_update(
+            session.get("_last_updated_dt"), now
+        ):
+            continue
+
+        if not _is_recent_live_update(afk_update, now):
+            session["afk_status"] = None
+        if not _is_recent_live_update(window_update, now):
+            session["current_app"] = None
+            session["current_title"] = None
+            session["process_name"] = None
+            session["process_path"] = None
+            session["explorer_path"] = None
+
         session["state"] = _derive_effective_state(
             session.get("session_state"), session.get("afk_status")
         )
