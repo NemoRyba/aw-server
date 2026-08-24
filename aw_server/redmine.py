@@ -9,7 +9,93 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 class RedmineReadOnlyError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        code: str = "redmine_query_failed",
+        detail: Optional[str] = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.detail = detail or message
+
+
+def describe_redmine_error(
+    error: Exception, config: Optional[Dict[str, Any]] = None
+) -> RedmineReadOnlyError:
+    if isinstance(error, RedmineReadOnlyError):
+        return error
+
+    config = config or {}
+    host = str(config.get("host") or "localhost").strip()
+    port = _coerce_int(config.get("port"), 3306)
+    username = str(config.get("username") or "").strip()
+    database = str(config.get("database") or "").strip()
+    detail = _error_detail(error)
+    lower_detail = detail.lower()
+
+    if (
+        "can't connect" in lower_detail
+        or "cannot connect" in lower_detail
+        or "connection refused" in lower_detail
+        or "lost connection" in lower_detail
+        or "server has gone away" in lower_detail
+        or "timed out" in lower_detail
+        or "timeout" in lower_detail
+        or "10061" in lower_detail
+        or "2003" in lower_detail
+        or "2006" in lower_detail
+        or "2013" in lower_detail
+    ):
+        return RedmineReadOnlyError(
+            f"Redmine database is not reachable at {host}:{port}. "
+            "Check that MySQL is running after the reboot and that the firewall "
+            "allows the ActivityWatch server.",
+            code="redmine_connection_failed",
+            detail=detail,
+        )
+
+    if "access denied" in lower_detail or "1045" in lower_detail:
+        return RedmineReadOnlyError(
+            f"Redmine database rejected user '{username}'. Re-enter the saved "
+            "password and check the SELECT grant for the ActivityWatch server host.",
+            code="redmine_access_denied",
+            detail=detail,
+        )
+
+    if "unknown database" in lower_detail or "1049" in lower_detail:
+        return RedmineReadOnlyError(
+            f"Redmine database '{database}' was not found. Check the configured database name.",
+            code="redmine_database_missing",
+            detail=detail,
+        )
+
+    if "doesn't exist" in lower_detail or "does not exist" in lower_detail or "1146" in lower_detail:
+        return RedmineReadOnlyError(
+            "Redmine tables were not found. Check the database name and table prefix.",
+            code="redmine_table_missing",
+            detail=detail,
+        )
+
+    if "unknown column" in lower_detail or "1054" in lower_detail:
+        return RedmineReadOnlyError(
+            "Redmine returned an unexpected table layout. Check the Redmine database version/schema.",
+            code="redmine_schema_mismatch",
+            detail=detail,
+        )
+
+    return RedmineReadOnlyError(
+        f"Redmine read-only query failed: {detail}",
+        code="redmine_query_failed",
+        detail=detail,
+    )
+
+
+def _error_detail(error: Exception) -> str:
+    args = getattr(error, "args", None)
+    if args:
+        return " ".join(str(part) for part in args if part is not None).strip()
+    return str(error).strip() or error.__class__.__name__
 
 
 def _coerce_int(value: Any, default: int = 0) -> int:
@@ -145,6 +231,8 @@ class RedmineReadOnlySource:
             except ImportError:
                 if self.driver == "pymysql":
                     raise RedmineReadOnlyError("PyMySQL is not installed")
+            except Exception as error:
+                raise describe_redmine_error(error, self.config)
 
         if self.driver in {"auto", "mysql-connector", "mysql_connector"}:
             try:
@@ -152,9 +240,14 @@ class RedmineReadOnlySource:
             except ImportError:
                 if self.driver in {"mysql-connector", "mysql_connector"}:
                     raise RedmineReadOnlyError("mysql-connector-python is not installed")
+            except Exception as error:
+                raise describe_redmine_error(error, self.config)
 
         if self.driver in {"auto", "mysql-cli", "mysql_cli", "cli"}:
-            return self._query_mysql_cli(sql, params)
+            try:
+                return self._query_mysql_cli(sql, params)
+            except Exception as error:
+                raise describe_redmine_error(error, self.config)
 
         raise RedmineReadOnlyError(f"Unsupported Redmine MySQL driver: {self.driver}")
 

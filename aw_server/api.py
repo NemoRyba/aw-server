@@ -46,6 +46,7 @@ from .fleet_summary_store import FleetSummaryStore
 from .redmine import (
     RedmineReadOnlyError,
     RedmineReadOnlySource,
+    describe_redmine_error,
     normalize_email,
     redmine_spent_on_range,
 )
@@ -568,8 +569,15 @@ class ServerAPI:
                 spent_from=spent_from,
                 spent_to=spent_to,
             )
-        except (RedmineReadOnlyError, RuntimeError) as error:
-            payload["error"] = str(error)
+        except Exception as error:
+            readable_error = describe_redmine_error(error, config)
+            if isinstance(error, RedmineReadOnlyError):
+                logger.warning("Redmine comparison failed: %s", readable_error)
+            else:
+                logger.exception("Redmine comparison failed: %s", readable_error)
+            payload["error"] = str(readable_error)
+            payload["error_code"] = readable_error.code
+            payload["error_detail"] = readable_error.detail
             payload["users"] = [
                 self._redmine_unmatched_user_payload(username, profiles[username])
                 for username in selected_usernames
