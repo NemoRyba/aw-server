@@ -15,6 +15,7 @@ LIVE_STALE_AFTER = timedelta(minutes=2)
 LIVE_TERMINAL_SESSION_RETENTION = timedelta(minutes=15)
 LIVE_TERMINAL_STATES = {"disconnected", "logged_off", "no_session"}
 DEFAULT_REPORT_RANGE = timedelta(days=7)
+AGGREGATED_ACTIVITY_MAX_ROWS_PER_BIN = 120
 
 
 def _utcnow() -> datetime:
@@ -108,6 +109,60 @@ def _normalize_range(
     if start > end:
         start, end = end, start
     return start, end
+
+
+def _start_of_timeline_unit(value: datetime, unit: str) -> datetime:
+    if unit == "month":
+        return value.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    if unit == "day":
+        return value.replace(hour=0, minute=0, second=0, microsecond=0)
+    return value.replace(minute=0, second=0, microsecond=0)
+
+
+def _add_timeline_unit(value: datetime, unit: str) -> datetime:
+    if unit == "month":
+        year = value.year
+        month = value.month + 1
+        if month > 12:
+            year += 1
+            month = 1
+        return value.replace(year=year, month=month, day=1)
+    if unit == "day":
+        return value + timedelta(days=1)
+    return value + timedelta(hours=1)
+
+
+def _timeline_bins(start: datetime, end: datetime) -> Tuple[str, List[Dict[str, Any]]]:
+    total_days = max(1.0, (end - start).total_seconds() / 86400.0)
+    unit = "day"
+    if total_days <= 2:
+        unit = "hour"
+    elif total_days > 370:
+        unit = "month"
+
+    cursor = _start_of_timeline_unit(start, unit)
+    max_bins = 400 if unit == "day" else 240
+    bins: List[Dict[str, Any]] = []
+
+    while cursor < end and len(bins) < max_bins:
+        raw_bin_start = cursor
+        raw_bin_end = _add_timeline_unit(cursor, unit)
+        bin_start = max(raw_bin_start, start)
+        bin_end = min(raw_bin_end, end)
+        if bin_end > bin_start:
+            bins.append(
+                {
+                    "index": len(bins),
+                    "unit": unit,
+                    "start": bin_start,
+                    "end": bin_end,
+                    "active_session_seconds": 0.0,
+                    "not_afk_active_session_seconds": 0.0,
+                }
+            )
+        cursor = raw_bin_end
+
+    return unit, bins
 
 
 def _normalize_device_ids(
@@ -1185,6 +1240,384 @@ def _window_event_breakdown(
         afk_seconds = total_seconds
 
     return (total_seconds, active_seconds, afk_seconds)
+
+
+def _bin_session_seconds(
+    bins: List[Dict[str, Any]],
+    intervals: Iterable[Tuple[datetime, datetime]],
+) -> List[float]:
+    totals = [0.0 for _ in bins]
+    merged_intervals = _merge_intervals(intervals)
+    if not merged_intervals:
+        return totals
+
+    for index, bin_row in enumerate(bins):
+        totals[index] = _sum_interval_overlaps(
+            bin_row["start"], bin_row["end"], merged_intervals
+        )
+    return totals
+
+
+def _not_afk_active_session_intervals(
+    active_session_intervals: Dict[Tuple[str, str, str], List[Tuple[datetime, datetime]]],
+    known_session_keys: Set[Tuple[str, str, str]],
+    afk_intervals: Dict[Tuple[str, str, str], Dict[str, List[Tuple[datetime, datetime]]]],
+) -> List[Tuple[datetime, datetime]]:
+    not_afk_active_intervals: List[Tuple[datetime, datetime]] = []
+    for session_key in known_session_keys:
+        session_active_intervals = active_session_intervals.get(session_key, [])
+        if not session_active_intervals:
+            continue
+
+        session_afk_intervals = afk_intervals.get(session_key)
+        if session_afk_intervals is None:
+            not_afk_active_intervals.extend(session_active_intervals)
+            continue
+
+        not_afk_active_intervals.extend(
+            _intersect_intervals(
+                session_active_intervals,
+                session_afk_intervals.get("not-afk", []),
+            )
+        )
+    return _merge_intervals(not_afk_active_intervals)
+
+
+def _aggregate_window_segment(
+    rows: Dict[Tuple[int, str, str, str, str, str, str, bool], Dict[str, Any]],
+    *,
+    bin_index: int,
+    bin_start: datetime,
+    identity: Dict[str, Any],
+    data: Dict[str, Any],
+    seconds: float,
+    afk: bool,
+) -> None:
+    if seconds <= 1:
+        return
+
+    app = str(data.get("app") or data.get("process_name") or "Unknown")
+    title = str(data.get("title") or "(no title)")
+    process_name = str(data.get("process_name") or app)
+    process_path = str(data.get("process_path") or "")
+    device_id = str(identity.get("device_id") or "unknown")
+    device_name = str(identity.get("device_name") or device_id)
+    key = (
+        bin_index,
+        app,
+        title,
+        process_name,
+        process_path,
+        device_id,
+        device_name,
+        afk,
+    )
+    row = rows.setdefault(
+        key,
+        {
+            "bin_index": bin_index,
+            "timestamp": bin_start,
+            "duration": 0.0,
+            "data": {
+                "username": identity.get("username") or "unknown",
+                "device_id": device_id,
+                "device_name": device_name,
+                "session_id": "aggregate",
+                "app": app,
+                "title": title,
+                "process_name": process_name,
+                "process_path": process_path,
+                "$afk": afk,
+                "$aggregate": True,
+            },
+        },
+    )
+    row["duration"] += seconds
+
+
+def _cap_aggregated_activity_events(
+    events: List[Dict[str, Any]], max_rows_per_bin: int
+) -> Tuple[List[Dict[str, Any]], bool]:
+    if max_rows_per_bin <= 0:
+        return events, False
+
+    capped: List[Dict[str, Any]] = []
+    truncated = False
+    events_by_bin: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    for event in events:
+        events_by_bin[int(event.get("bin_index") or 0)].append(event)
+
+    for bin_index in sorted(events_by_bin):
+        bin_events = sorted(
+            events_by_bin[bin_index],
+            key=lambda event: float(event.get("duration") or 0.0),
+            reverse=True,
+        )
+        if len(bin_events) <= max_rows_per_bin:
+            capped.extend(bin_events)
+            continue
+
+        truncated = True
+        keep_count = max(1, max_rows_per_bin - 2)
+        kept = bin_events[:keep_count]
+        remainder = bin_events[keep_count:]
+        capped.extend(kept)
+
+        other_by_afk: Dict[bool, Dict[str, Any]] = {}
+        for event in remainder:
+            afk = bool(dict(event.get("data") or {}).get("$afk"))
+            other = other_by_afk.get(afk)
+            if other is None:
+                other = {
+                    "bin_index": bin_index,
+                    "timestamp": event["timestamp"],
+                    "duration": 0.0,
+                    "data": {
+                        "username": dict(event.get("data") or {}).get(
+                            "username", "unknown"
+                        ),
+                        "device_id": "multiple",
+                        "device_name": "Multiple devices",
+                        "session_id": "aggregate",
+                        "app": "Other",
+                        "title": "Aggregated smaller entries",
+                        "process_name": "Other",
+                        "$afk": afk,
+                        "$aggregate": True,
+                        "$aggregate_other": True,
+                    },
+                }
+                other_by_afk[afk] = other
+            other["duration"] += float(event.get("duration") or 0.0)
+        capped.extend(
+            other
+            for other in other_by_afk.values()
+            if float(other.get("duration") or 0.0) > 1
+        )
+
+    return capped, truncated
+
+
+def summarize_user_activity(
+    api,
+    username: str,
+    start: Optional[datetime],
+    end: Optional[datetime],
+    device_ids: Optional[Iterable[str]] = None,
+    include_afk_time: bool = False,
+    exclude_inactive_session_afk: bool = False,
+    max_rows_per_bin: int = AGGREGATED_ACTIVITY_MAX_ROWS_PER_BIN,
+) -> Dict[str, Any]:
+    start, end = _normalize_range(start, end)
+    selected_device_ids = _normalize_device_ids(device_ids=device_ids)
+    bin_unit, bins = _timeline_bins(start, end)
+
+    afk_intervals = _load_afk_intervals(
+        api,
+        username=username,
+        device_ids=selected_device_ids,
+        start=start,
+        end=end,
+    )
+    active_session_intervals, known_session_keys = _load_active_session_intervals(
+        api,
+        username=username,
+        device_ids=selected_device_ids,
+        start=start,
+        end=end,
+    )
+    active_session_totals = _bin_session_seconds(
+        bins,
+        (
+            interval
+            for intervals in active_session_intervals.values()
+            for interval in intervals
+        ),
+    )
+    not_afk_active_totals = _bin_session_seconds(
+        bins,
+        _not_afk_active_session_intervals(
+            active_session_intervals,
+            known_session_keys,
+            afk_intervals,
+        ),
+    )
+    for index, bin_row in enumerate(bins):
+        bin_row["active_session_seconds"] = active_session_totals[index]
+        bin_row["not_afk_active_session_seconds"] = not_afk_active_totals[index]
+
+    aggregate_rows: Dict[
+        Tuple[int, str, str, str, str, str, str, bool], Dict[str, Any]
+    ] = {}
+    source_event_count = 0
+
+    for bucket in _matching_buckets(
+        api,
+        kind="window",
+        username=username,
+        device_ids=selected_device_ids,
+    ):
+        events = api.get_events(bucket["bucket_id"], limit=-1, start=start, end=end)
+        for event in events:
+            identity = _event_identity(bucket, event)
+            if identity["username"] != username:
+                continue
+            if not _matches_device_filter(identity["device_id"], selected_device_ids):
+                continue
+
+            interval = _clip_event_interval(event, start, end)
+            if interval is None:
+                continue
+
+            source_event_count += 1
+            data = dict(event.get("data") or {})
+            session_key = _identity_session_key(identity)
+            session_afk_intervals = afk_intervals.get(session_key)
+            has_afk_data = session_afk_intervals is not None
+            not_afk_intervals = (
+                session_afk_intervals.get("not-afk", [])
+                if session_afk_intervals is not None
+                else []
+            )
+            afk_only_intervals = (
+                session_afk_intervals.get("afk", [])
+                if session_afk_intervals is not None
+                else []
+            )
+            if (
+                exclude_inactive_session_afk
+                and session_key in known_session_keys
+                and active_session_intervals.get(session_key)
+            ):
+                afk_only_intervals = _intersect_intervals(
+                    afk_only_intervals,
+                    active_session_intervals.get(session_key, []),
+                )
+
+            event_start, event_end = interval
+            for bin_row in bins:
+                if bin_row["end"] <= event_start:
+                    continue
+                if bin_row["start"] >= event_end:
+                    break
+
+                segment_start = max(event_start, bin_row["start"])
+                segment_end = min(event_end, bin_row["end"])
+                if segment_end <= segment_start:
+                    continue
+
+                segment_seconds = (segment_end - segment_start).total_seconds()
+                if include_afk_time:
+                    afk_seconds = (
+                        _sum_interval_overlaps(
+                            segment_start,
+                            segment_end,
+                            afk_only_intervals,
+                        )
+                        if has_afk_data
+                        else 0.0
+                    )
+                    afk_seconds = min(afk_seconds, segment_seconds)
+                    active_seconds = max(0.0, segment_seconds - afk_seconds)
+                    _aggregate_window_segment(
+                        aggregate_rows,
+                        bin_index=bin_row["index"],
+                        bin_start=bin_row["start"],
+                        identity=identity,
+                        data=data,
+                        seconds=active_seconds,
+                        afk=False,
+                    )
+                    _aggregate_window_segment(
+                        aggregate_rows,
+                        bin_index=bin_row["index"],
+                        bin_start=bin_row["start"],
+                        identity=identity,
+                        data=data,
+                        seconds=afk_seconds,
+                        afk=True,
+                    )
+                    continue
+
+                active_seconds = (
+                    _sum_interval_overlaps(
+                        segment_start,
+                        segment_end,
+                        not_afk_intervals,
+                    )
+                    if has_afk_data
+                    else segment_seconds
+                )
+                _aggregate_window_segment(
+                    aggregate_rows,
+                    bin_index=bin_row["index"],
+                    bin_start=bin_row["start"],
+                    identity=identity,
+                    data=data,
+                    seconds=min(active_seconds, segment_seconds),
+                    afk=False,
+                )
+
+    aggregate_events = sorted(
+        aggregate_rows.values(),
+        key=lambda event: (
+            event.get("bin_index", 0),
+            -float(event.get("duration") or 0.0),
+            str(dict(event.get("data") or {}).get("app") or ""),
+        ),
+    )
+    uncapped_event_count = len(aggregate_events)
+    aggregate_events, truncated = _cap_aggregated_activity_events(
+        aggregate_events, max_rows_per_bin
+    )
+
+    payload_events = []
+    for index, event in enumerate(aggregate_events, start=1):
+        data = dict(event.get("data") or {})
+        payload_events.append(
+            {
+                "id": f"aggregate-{event.get('bin_index', 0)}-{index}",
+                "timestamp": _isoformat(event["timestamp"]),
+                "duration": round(float(event.get("duration") or 0.0), 3),
+                "data": data,
+            }
+        )
+
+    return {
+        "generated_at": _utcnow().isoformat(),
+        "mode": "aggregate",
+        "range": {"start": _isoformat(start), "end": _isoformat(end)},
+        "filters": {
+            "username": username,
+            "device_ids": selected_device_ids,
+            "include_afk_time": include_afk_time,
+            "exclude_inactive_session_afk": exclude_inactive_session_afk,
+            "max_rows_per_bin": max_rows_per_bin,
+        },
+        "bin_unit": bin_unit,
+        "bins": [
+            {
+                "index": bin_row["index"],
+                "unit": bin_row["unit"],
+                "start": _isoformat(bin_row["start"]),
+                "end": _isoformat(bin_row["end"]),
+                "active_session_seconds": round(
+                    float(bin_row.get("active_session_seconds") or 0.0), 3
+                ),
+                "not_afk_active_session_seconds": round(
+                    float(bin_row.get("not_afk_active_session_seconds") or 0.0), 3
+                ),
+            }
+            for bin_row in bins
+        ],
+        "events": payload_events,
+        "stats": {
+            "source_event_count": source_event_count,
+            "uncapped_event_count": uncapped_event_count,
+            "returned_event_count": len(payload_events),
+            "truncated": truncated,
+        },
+    }
 
 
 def report_time_by_app(

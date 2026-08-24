@@ -824,6 +824,25 @@ class FleetUserResource(Resource):
         )
 
 
+@api.route("/0/fleet/users/<string:username>/activity-summary")
+class FleetUserActivitySummaryResource(Resource):
+    def get(self, username: str):
+        start, end = _fleet_range()
+        return jsonify(
+            current_app.api.get_fleet_user_activity(
+                username,
+                start=start,
+                end=end,
+                device_ids=_fleet_device_ids(),
+                include_afk_time=_fleet_bool_arg("include_afk_time", False),
+                exclude_inactive_session_afk=_fleet_bool_arg(
+                    "exclude_inactive_session_afk"
+                ),
+                max_rows_per_bin=_fleet_int_arg("max_rows_per_bin", 120, 20, 400),
+            )
+        )
+
+
 @api.route("/0/fleet/users/<string:username>/summary/recalculate")
 class FleetUserSummaryRecalculateResource(Resource):
     def post(self, username: str):

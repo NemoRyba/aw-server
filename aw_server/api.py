@@ -38,6 +38,7 @@ from .fleet import (
     summarize_devices,
     summarize_live_state,
     summarize_user,
+    summarize_user_activity,
     summarize_users,
 )
 from .fleet_sync import sync_batch, sync_handshake
@@ -1226,6 +1227,27 @@ class ServerAPI:
         detail["totals"] = summary["totals"]
         detail["summary_cache"] = summary["summary_cache"]
         return detail
+
+    def get_fleet_user_activity(
+        self,
+        username,
+        start=None,
+        end=None,
+        device_ids=None,
+        include_afk_time=False,
+        exclude_inactive_session_afk=False,
+        max_rows_per_bin=120,
+    ):
+        return summarize_user_activity(
+            self,
+            username,
+            start=start,
+            end=end,
+            device_ids=device_ids,
+            include_afk_time=include_afk_time,
+            exclude_inactive_session_afk=exclude_inactive_session_afk,
+            max_rows_per_bin=max_rows_per_bin,
+        )
 
     def get_fleet_devices(self):
         return summarize_devices(self)
