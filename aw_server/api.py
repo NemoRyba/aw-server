@@ -483,6 +483,79 @@ class ServerAPI:
     def set_redmine_config(self, value):
         return self.settings.set_redmine_config(value)
 
+    def get_redmine_user_mappings(self):
+        config = self.settings.get_redmine_config(include_secret=True)
+        public_config = self.settings.get_redmine_config(include_secret=False)
+        mappings = self.settings.get_redmine_user_mappings()
+        users = self.get_fleet_users()["users"]
+        payload = {
+            "generated_at": datetime.now().astimezone().isoformat(),
+            "enabled": bool(config.get("enabled")),
+            "users": [],
+            "redmine_users": [],
+            "config": {
+                "driver": public_config.get("driver"),
+                "host": public_config.get("host"),
+                "database": public_config.get("database"),
+            },
+        }
+        profiles = {
+            user["username"]: self.settings.lookup_ldap_user_profile(user["username"])
+            for user in users
+        }
+
+        if not config.get("enabled"):
+            payload["message"] = "Redmine integration is disabled"
+            payload["users"] = [
+                self._redmine_mapping_payload(
+                    username=user["username"],
+                    profile=profiles[user["username"]],
+                    mappings=mappings,
+                )
+                for user in users
+            ]
+            return payload
+
+        try:
+            redmine_users = RedmineReadOnlySource(config).active_users()
+        except Exception as error:
+            readable_error = describe_redmine_error(error, config)
+            logger.warning("Redmine mapping lookup failed: %s", readable_error)
+            payload["error"] = str(readable_error)
+            payload["error_code"] = readable_error.code
+            payload["error_detail"] = readable_error.detail
+            payload["users"] = [
+                self._redmine_mapping_payload(
+                    username=user["username"],
+                    profile=profiles[user["username"]],
+                    mappings=mappings,
+                )
+                for user in users
+            ]
+            return payload
+
+        redmine_users_by_email, redmine_users_by_id = self._redmine_user_indexes(
+            redmine_users
+        )
+        payload["redmine_users"] = [
+            self._redmine_public_user_payload(user) for user in redmine_users
+        ]
+        payload["users"] = [
+            self._redmine_mapping_payload(
+                username=user["username"],
+                profile=profiles[user["username"]],
+                mappings=mappings,
+                redmine_users_by_email=redmine_users_by_email,
+                redmine_users_by_id=redmine_users_by_id,
+            )
+            for user in users
+        ]
+        return payload
+
+    def set_redmine_user_mapping(self, username, redmine_user_id=None):
+        self.settings.set_redmine_user_mapping(username, redmine_user_id)
+        return self.get_redmine_user_mappings()
+
     def test_redmine_config(self, value=None):
         config = self.settings._normalize_redmine_config(
             value or self.settings.get_redmine_config(include_secret=True),
@@ -550,19 +623,24 @@ class ServerAPI:
         try:
             source = RedmineReadOnlySource(config)
             redmine_users = source.active_users()
-            redmine_users_by_email = {
-                normalize_email(user.get("mail")): user
-                for user in redmine_users
-                if normalize_email(user.get("mail"))
-            }
+            redmine_users_by_email, redmine_users_by_id = self._redmine_user_indexes(
+                redmine_users
+            )
+            mappings = self.settings.get_redmine_user_mappings()
 
             matched_by_username = {}
+            match_by_username = {}
             for username, profile in profiles.items():
-                redmine_user = redmine_users_by_email.get(
-                    normalize_email(profile.get("email"))
+                match = self._redmine_match_for_profile(
+                    username=username,
+                    profile=profile,
+                    mappings=mappings,
+                    redmine_users_by_email=redmine_users_by_email,
+                    redmine_users_by_id=redmine_users_by_id,
                 )
-                if redmine_user:
-                    matched_by_username[username] = redmine_user
+                match_by_username[username] = match
+                if match.get("matched"):
+                    matched_by_username[username] = match["redmine_user"]
 
             project_rows = source.time_by_project(
                 user_ids=[user["id"] for user in matched_by_username.values()],
@@ -607,9 +685,14 @@ class ServerAPI:
         total_hours = 0.0
         for username in selected_usernames:
             profile = profiles[username]
+            match = match_by_username.get(username, {})
             redmine_user = matched_by_username.get(username)
             if not redmine_user:
-                rows.append(self._redmine_unmatched_user_payload(username, profile))
+                rows.append(
+                    self._redmine_unmatched_user_payload(
+                        username, profile, match=match
+                    )
+                )
                 continue
 
             user_id = int(redmine_user["id"])
@@ -623,6 +706,8 @@ class ServerAPI:
                     "ldap_source": profile.get("source") or "",
                     "matched": True,
                     "status": "matched",
+                    "match_source": match.get("match_source") or "unknown",
+                    "match_reason": match.get("match_reason") or "",
                     "redmine_user_id": user_id,
                     "redmine_login": redmine_user.get("login") or "",
                     "redmine_name": " ".join(
@@ -647,9 +732,155 @@ class ServerAPI:
         }
         return payload
 
-    def _redmine_unmatched_user_payload(self, username, profile):
-        status = "missing_email"
-        if profile.get("email"):
+    def _redmine_user_indexes(self, redmine_users):
+        users_by_email = {}
+        users_by_id = {}
+        for user in redmine_users:
+            user_id = int(user.get("id") or 0)
+            if user_id > 0:
+                users_by_id[user_id] = user
+            email = normalize_email(user.get("mail"))
+            if email and email not in users_by_email:
+                users_by_email[email] = user
+        return users_by_email, users_by_id
+
+    def _redmine_public_user_payload(self, user):
+        return {
+            "id": int(user.get("id") or 0),
+            "login": str(user.get("login") or ""),
+            "firstname": str(user.get("firstname") or ""),
+            "lastname": str(user.get("lastname") or ""),
+            "mail": normalize_email(user.get("mail")),
+            "name": self._redmine_user_name(user),
+        }
+
+    def _redmine_user_name(self, user):
+        return " ".join(
+            part
+            for part in (
+                str(user.get("firstname") or "").strip(),
+                str(user.get("lastname") or "").strip(),
+            )
+            if part
+        )
+
+    def _redmine_match_for_profile(
+        self,
+        *,
+        username,
+        profile,
+        mappings,
+        redmine_users_by_email,
+        redmine_users_by_id,
+    ):
+        normalized_username = self.settings._normalize_lookup_username(username)
+        override_user_id = int(mappings.get(normalized_username) or 0)
+        if override_user_id:
+            redmine_user = redmine_users_by_id.get(override_user_id)
+            if redmine_user:
+                return {
+                    "matched": True,
+                    "status": "matched",
+                    "match_source": "manual",
+                    "match_reason": "Manual Redmine user override from settings.",
+                    "redmine_user": redmine_user,
+                    "override_redmine_user_id": override_user_id,
+                    "automatic_redmine_user": None,
+                }
+            return {
+                "matched": False,
+                "status": "manual_missing",
+                "match_source": "manual",
+                "match_reason": (
+                    f"Manual override points to Redmine user ID {override_user_id}, "
+                    "but that active Redmine user was not found."
+                ),
+                "redmine_user": None,
+                "override_redmine_user_id": override_user_id,
+                "automatic_redmine_user": None,
+            }
+
+        email = normalize_email(profile.get("email"))
+        if not email:
+            return {
+                "matched": False,
+                "status": "missing_email",
+                "match_source": "none",
+                "match_reason": "No LDAP email address was found for this Windows user.",
+                "redmine_user": None,
+                "override_redmine_user_id": None,
+                "automatic_redmine_user": None,
+            }
+
+        redmine_user = redmine_users_by_email.get(email)
+        if redmine_user:
+            return {
+                "matched": True,
+                "status": "matched",
+                "match_source": "email",
+                "match_reason": f"Matched automatically by email address {email}.",
+                "redmine_user": redmine_user,
+                "override_redmine_user_id": None,
+                "automatic_redmine_user": redmine_user,
+            }
+
+        return {
+            "matched": False,
+            "status": "no_redmine_user",
+            "match_source": "none",
+            "match_reason": (
+                f"No active Redmine user was found with email address {email}."
+            ),
+            "redmine_user": None,
+            "override_redmine_user_id": None,
+            "automatic_redmine_user": None,
+        }
+
+    def _redmine_mapping_payload(
+        self,
+        *,
+        username,
+        profile,
+        mappings,
+        redmine_users_by_email=None,
+        redmine_users_by_id=None,
+    ):
+        redmine_users_by_email = redmine_users_by_email or {}
+        redmine_users_by_id = redmine_users_by_id or {}
+        match = self._redmine_match_for_profile(
+            username=username,
+            profile=profile,
+            mappings=mappings,
+            redmine_users_by_email=redmine_users_by_email,
+            redmine_users_by_id=redmine_users_by_id,
+        )
+        automatic_user = match.get("automatic_redmine_user")
+        effective_user = match.get("redmine_user")
+        return {
+            "username": username,
+            "email": profile.get("email") or "",
+            "display_name": profile.get("display_name") or "",
+            "ldap_source": profile.get("source") or "",
+            "status": match.get("status") or "not_loaded",
+            "match_source": match.get("match_source") or "none",
+            "match_reason": match.get("match_reason") or "",
+            "override_redmine_user_id": match.get("override_redmine_user_id"),
+            "automatic_redmine_user": (
+                self._redmine_public_user_payload(automatic_user)
+                if automatic_user
+                else None
+            ),
+            "redmine_user": (
+                self._redmine_public_user_payload(effective_user)
+                if effective_user
+                else None
+            ),
+        }
+
+    def _redmine_unmatched_user_payload(self, username, profile, match=None):
+        match = match or {}
+        status = match.get("status") or "missing_email"
+        if not match and profile.get("email"):
             status = "no_redmine_user"
         return {
             "username": username,
@@ -658,6 +889,8 @@ class ServerAPI:
             "ldap_source": profile.get("source") or "",
             "matched": False,
             "status": status,
+            "match_source": match.get("match_source") or "none",
+            "match_reason": match.get("match_reason") or "",
             "redmine_user_id": None,
             "redmine_login": "",
             "redmine_name": "",
@@ -804,9 +1037,26 @@ class ServerAPI:
         start=None,
         end=None,
         exclude_inactive_session_afk=True,
+        usernames: Optional[Iterable[str]] = None,
     ):
         start, end = normalize_fleet_range(start, end)
         users = self.get_fleet_users()["users"]
+        if usernames is not None:
+            users_by_username = {
+                str(user.get("username") or "").lower(): user for user in users
+            }
+            selected_users = []
+            seen = set()
+            for username in usernames:
+                normalized = str(username or "").strip().lower()
+                if not normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                user = users_by_username.get(normalized)
+                if user:
+                    selected_users.append(user)
+            users = selected_users
+
         rows = []
         for user in users:
             summary = self.get_fleet_user_summary_value(

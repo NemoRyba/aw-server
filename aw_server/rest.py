@@ -598,6 +598,23 @@ class AdminRedmineTestResource(Resource):
         return jsonify(current_app.api.test_redmine_config(request.get_json() or {}))
 
 
+@api.route("/0/admin/redmine/mappings")
+class AdminRedmineMappingsResource(Resource):
+    def get(self):
+        _require_builtin_admin_user()
+        return jsonify(current_app.api.get_redmine_user_mappings())
+
+    def post(self):
+        _require_builtin_admin_user()
+        data = request.get_json() or {}
+        return jsonify(
+            current_app.api.set_redmine_user_mapping(
+                data.get("username") or "",
+                data.get("redmine_user_id"),
+            )
+        )
+
+
 # FLEET
 
 
@@ -627,6 +644,29 @@ def _fleet_device_ids():
             continue
         seen.add(device_id)
         unique.append(device_id)
+    return unique
+
+
+def _fleet_usernames_arg():
+    values = []
+    for key in ("username", "usernames", "usernames[]"):
+        values.extend(request.args.getlist(key))
+    usernames = []
+    for value in values:
+        for part in str(value).split(","):
+            part = part.strip()
+            if part:
+                usernames.append(part)
+    if not usernames:
+        return None
+    unique = []
+    seen = set()
+    for username in usernames:
+        normalized = username.lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        unique.append(username)
     return unique
 
 
@@ -717,6 +757,7 @@ class FleetSummaryResource(Resource):
             current_app.api.get_fleet_summary(
                 start=start,
                 end=end,
+                usernames=_fleet_usernames_arg(),
                 exclude_inactive_session_afk=_fleet_bool_arg(
                     "exclude_inactive_session_afk", True
                 ),

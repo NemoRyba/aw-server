@@ -18,6 +18,7 @@ class Settings:
     ADMIN_UI_CONFIG_KEY = "_admin_ui_config"
     LDAP_CONFIG_KEY = "_ldap_config"
     REDMINE_CONFIG_KEY = "_redmine_config"
+    REDMINE_USER_MAPPINGS_KEY = "_redmine_user_mappings"
     PASSWORD_HASH_KEY = "password_hash"
     LEGACY_PASSWORD_KEY = "password"
     LOCAL_AUTH_SOURCE = "local"
@@ -54,6 +55,7 @@ class Settings:
         ADMIN_UI_CONFIG_KEY,
         LDAP_CONFIG_KEY,
         REDMINE_CONFIG_KEY,
+        REDMINE_USER_MAPPINGS_KEY,
     }
 
     def __init__(self, testing: bool):
@@ -224,6 +226,22 @@ class Settings:
         public_config["password_present"] = bool(config.get("password"))
         return public_config
 
+    def _normalize_redmine_user_mappings(self, value):
+        mappings = {}
+        if not isinstance(value, dict):
+            return mappings
+        for username, redmine_user_id in value.items():
+            normalized_username = self._normalize_lookup_username(username)
+            if not normalized_username:
+                continue
+            try:
+                parsed_user_id = int(redmine_user_id)
+            except (TypeError, ValueError):
+                continue
+            if parsed_user_id > 0:
+                mappings[normalized_username] = parsed_user_id
+        return mappings
+
     def _public_auth_user(self, username, user):
         user = user if isinstance(user, dict) else {}
         return {
@@ -348,6 +366,41 @@ class Settings:
         self.data[self.REDMINE_CONFIG_KEY] = config
         self.save()
         return self._public_redmine_config(config)
+
+    def get_redmine_user_mappings(self):
+        mappings = self._normalize_redmine_user_mappings(
+            self.data.get(self.REDMINE_USER_MAPPINGS_KEY)
+        )
+        if self.data.get(self.REDMINE_USER_MAPPINGS_KEY) != mappings:
+            if mappings:
+                self.data[self.REDMINE_USER_MAPPINGS_KEY] = mappings
+            elif self.REDMINE_USER_MAPPINGS_KEY in self.data:
+                del self.data[self.REDMINE_USER_MAPPINGS_KEY]
+            self.save()
+        return mappings
+
+    def set_redmine_user_mapping(self, username: str, redmine_user_id):
+        normalized_username = self._normalize_lookup_username(username)
+        if not normalized_username:
+            return self.get_redmine_user_mappings()
+
+        mappings = self.get_redmine_user_mappings()
+        try:
+            parsed_user_id = int(redmine_user_id)
+        except (TypeError, ValueError):
+            parsed_user_id = 0
+
+        if parsed_user_id > 0:
+            mappings[normalized_username] = parsed_user_id
+        elif normalized_username in mappings:
+            del mappings[normalized_username]
+
+        if mappings:
+            self.data[self.REDMINE_USER_MAPPINGS_KEY] = mappings
+        elif self.REDMINE_USER_MAPPINGS_KEY in self.data:
+            del self.data[self.REDMINE_USER_MAPPINGS_KEY]
+        self.save()
+        return mappings
 
     def test_ldap_config(self, value=None, username="", password=""):
         previous = self.data.get(self.LDAP_CONFIG_KEY)
