@@ -26,8 +26,13 @@ from aw_transform import heartbeat_merge
 from .__about__ import __version__
 from .exceptions import NotFound
 from .fleet import (
+    build_user_detail_from_summary,
+    calculate_user_summary_day,
     calculate_user_summary_totals,
     format_fleet_datetime,
+    iter_fleet_day_ranges,
+    merge_user_summary_chunks,
+    parse_fleet_datetime,
     get_bucket_identity,
     group_buckets_by_device,
     group_buckets_by_user,
@@ -40,6 +45,7 @@ from .fleet import (
     summarize_user,
     summarize_user_activity,
     summarize_users,
+    wrap_fleet_event_cache,
 )
 from .fleet_sync import sync_batch, sync_handshake
 from .fleet_sync_store import FleetSyncStore
@@ -733,6 +739,171 @@ class ServerAPI:
         }
         return payload
 
+    def get_fleet_redmine_daily_comparison(self, start=None, end=None, usernames=None):
+        """Per fleet-day comparison: active session time (from the day-chunk
+        cache) vs the Redmine bookings of that day, entry by entry (project,
+        hours, comment) for every selected, mapped user."""
+        start, end = normalize_fleet_range(start, end)
+        selected_usernames = [
+            str(username).strip()
+            for username in (usernames or [])
+            if str(username).strip()
+        ]
+        config = self.settings.get_redmine_config(include_secret=True)
+
+        payload = {
+            "generated_at": datetime.now().astimezone().isoformat(),
+            "enabled": bool(config.get("enabled")),
+            "range": {
+                "start": format_fleet_datetime(start),
+                "end": format_fleet_datetime(end),
+            },
+            "days": [],
+        }
+        if not config.get("enabled"):
+            payload["message"] = "Redmine integration is disabled"
+            return payload
+        if not selected_usernames:
+            return payload
+
+        spent_from, spent_to = redmine_spent_on_range(start, end)
+        profiles = {
+            username: self.settings.lookup_ldap_user_profile(username)
+            for username in selected_usernames
+        }
+
+        try:
+            source = RedmineReadOnlySource(config)
+            redmine_users = source.active_users()
+            redmine_users_by_email, redmine_users_by_id = self._redmine_user_indexes(
+                redmine_users
+            )
+            mappings = self.settings.get_redmine_user_mappings()
+
+            matched_by_username = {}
+            for username, profile in profiles.items():
+                match = self._redmine_match_for_profile(
+                    username=username,
+                    profile=profile,
+                    mappings=mappings,
+                    redmine_users_by_email=redmine_users_by_email,
+                    redmine_users_by_id=redmine_users_by_id,
+                )
+                if match.get("matched"):
+                    matched_by_username[username] = match["redmine_user"]
+
+            entry_rows = source.daily_time_entries(
+                user_ids=[user["id"] for user in matched_by_username.values()],
+                spent_from=spent_from,
+                spent_to=spent_to,
+            )
+        except Exception as error:
+            readable_error = describe_redmine_error(error, config)
+            if isinstance(error, RedmineReadOnlyError):
+                logger.warning("Redmine daily comparison failed: %s", readable_error)
+            else:
+                logger.exception("Redmine daily comparison failed: %s", readable_error)
+            payload["error"] = str(readable_error)
+            payload["error_code"] = readable_error.code
+            payload["error_detail"] = readable_error.detail
+            return payload
+
+        username_by_user_id = {
+            int(user["id"]): username for username, user in matched_by_username.items()
+        }
+        entries_by_day_user = defaultdict(list)
+        for row in entry_rows:
+            username = username_by_user_id.get(int(row.get("user_id") or 0))
+            if not username:
+                continue
+            entries_by_day_user[(str(row.get("spent_on") or ""), username)].append(
+                {
+                    "project_id": row.get("project_id"),
+                    "project_name": row.get("project_name") or "",
+                    "hours": float(row.get("hours") or 0.0),
+                    "seconds": float(row.get("hours") or 0.0) * 3600.0,
+                    "comments": row.get("comments") or "",
+                }
+            )
+
+        # Per-user, per-fleet-day active seconds straight from the chunk cache.
+        precompute_config = self._normalize_fleet_summary_precompute_config(
+            self.settings.get(FLEET_SUMMARY_PRECOMPUTE_CONFIG_KEY, None)
+        )
+        day_ranges = iter_fleet_day_ranges(
+            start, end, precompute_config["start_of_day"]
+        )
+
+        days = []
+        for chunk_start, chunk_end in day_ranges:
+            day_key = chunk_start.astimezone().date().isoformat()
+            user_rows = []
+            day_active_total = 0.0
+            day_redmine_total = 0.0
+            for username in selected_usernames:
+                try:
+                    summary = self.get_fleet_user_summary_value(
+                        username,
+                        start=chunk_start,
+                        end=chunk_end,
+                        exclude_inactive_session_afk=True,
+                    )
+                    active_seconds = float(
+                        (summary.get("totals") or {}).get("active_seconds") or 0.0
+                    )
+                except Exception:
+                    logger.exception(
+                        "Unable to load daily totals for user %s on %s",
+                        username,
+                        day_key,
+                    )
+                    active_seconds = 0.0
+
+                matched = username in matched_by_username
+                entries = entries_by_day_user.get((day_key, username), [])
+                redmine_seconds = sum(entry["seconds"] for entry in entries)
+                if active_seconds < 1 and not entries:
+                    continue
+
+                day_active_total += active_seconds
+                day_redmine_total += redmine_seconds
+                user_rows.append(
+                    {
+                        "username": username,
+                        "matched": matched,
+                        "active_seconds": active_seconds,
+                        "redmine_seconds": redmine_seconds if matched else None,
+                        "redmine_hours": (
+                            redmine_seconds / 3600.0 if matched else None
+                        ),
+                        "delta_seconds": (
+                            active_seconds - redmine_seconds if matched else None
+                        ),
+                        "entries": entries,
+                    }
+                )
+
+            if user_rows:
+                days.append(
+                    {
+                        "date": day_key,
+                        "range": {
+                            "start": format_fleet_datetime(chunk_start),
+                            "end": format_fleet_datetime(chunk_end),
+                        },
+                        "totals": {
+                            "active_seconds": day_active_total,
+                            "redmine_seconds": day_redmine_total,
+                        },
+                        "users": user_rows,
+                    }
+                )
+
+        # Most recent day first.
+        days.sort(key=lambda day: day["date"], reverse=True)
+        payload["days"] = days
+        return payload
+
     def _redmine_user_indexes(self, redmine_users):
         users_by_email = {}
         users_by_id = {}
@@ -941,12 +1112,17 @@ class ServerAPI:
                 logger.exception("Fleet summary auto precompute failed")
 
     def _previous_summary_period(self, start_of_day: str):
-        hour, minute = [int(part) for part in start_of_day.split(":", 1)]
+        from .fleet import local_fleet_day_boundary, parse_start_of_day
+
+        hour, minute = parse_start_of_day(start_of_day)
         now = datetime.now().astimezone()
-        boundary = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        anchor = now.date()
+        boundary = local_fleet_day_boundary(anchor, hour, minute)
         if now < boundary:
-            boundary -= timedelta(days=1)
-        return boundary - timedelta(days=1), boundary
+            anchor = anchor - timedelta(days=1)
+            boundary = local_fleet_day_boundary(anchor, hour, minute)
+        previous = local_fleet_day_boundary(anchor - timedelta(days=1), hour, minute)
+        return previous, boundary
 
     def maybe_auto_precompute_fleet_summary(self):
         config = self.get_fleet_summary_precompute_config()
@@ -971,6 +1147,30 @@ class ServerAPI:
             start_of_day=config["start_of_day"],
         )
 
+    def invalidate_fleet_user_summaries(self, start, end, username=None):
+        """Invalidate cached summaries overlapping [start, end) after a manual
+        event edit/creation/deletion, so affected days recompute on demand."""
+        if start is None or end is None:
+            return 0
+        if end <= start:
+            end = start
+        return self.summary_store.delete_user_summaries_in_range(
+            range_start=format_fleet_datetime(start),
+            range_end=format_fleet_datetime(end),
+            username=username,
+        )
+
+    @staticmethod
+    def _fleet_day_row_valid(row, chunk_end) -> bool:
+        """A cached day row is trustworthy only if it was calculated AFTER the
+        day ended; otherwise it is a partial snapshot and must be recomputed."""
+        calculated_at = parse_fleet_datetime(
+            (row.get("summary_cache") or {}).get("calculated_at")
+        )
+        if calculated_at is None:
+            return False
+        return calculated_at >= chunk_end
+
     def get_fleet_user_summary_value(
         self,
         username,
@@ -980,40 +1180,91 @@ class ServerAPI:
         exclude_inactive_session_afk=True,
         force=False,
         source="on_demand",
+        events_api=None,
     ):
-        start, end = normalize_fleet_range(start, end)
-        range_start = format_fleet_datetime(start)
-        range_end = format_fleet_datetime(end)
-        cached = None
-        if not force:
-            cached = self.summary_store.get_user_summary(
-                username=username,
-                range_start=range_start,
-                range_end=range_end,
-                device_ids=device_ids,
-                exclude_inactive_session_afk=exclude_inactive_session_afk,
-            )
-        if cached:
-            return cached
+        """Chunked, cache-backed user summary.
 
-        summary = calculate_user_summary_totals(
-            self,
+        The range is split into fleet days (local start_of_day boundaries).
+        Complete days are served from the summary store and persisted after
+        computation (totals + apps + devices), so a multi-month range costs a
+        handful of SQLite lookups plus computation of only the days that are
+        missing — which the nightly precompute keeps filled. The current,
+        still-running day is always computed live and never persisted.
+        """
+        start, end = normalize_fleet_range(start, end)
+        # Read start_of_day without get_fleet_summary_precompute_config(),
+        # which also queries the run history — this path runs once per user
+        # on the summary page and should stay lookup-cheap.
+        config = self._normalize_fleet_summary_precompute_config(
+            self.settings.get(FLEET_SUMMARY_PRECOMPUTE_CONFIG_KEY, None)
+        )
+        chunks = iter_fleet_day_ranges(start, end, config["start_of_day"])
+        now = datetime.now().astimezone()
+
+        chunk_summaries = []
+        all_cached = bool(chunks) and not force
+        for chunk_start, chunk_end in chunks:
+            chunk_range_start = format_fleet_datetime(chunk_start)
+            chunk_range_end = format_fleet_datetime(chunk_end)
+            complete = chunk_end <= now
+
+            row = None
+            if not force and complete:
+                row = self.summary_store.get_user_summary(
+                    username=username,
+                    range_start=chunk_range_start,
+                    range_end=chunk_range_end,
+                    device_ids=device_ids,
+                    exclude_inactive_session_afk=exclude_inactive_session_afk,
+                )
+                if row is not None and (
+                    row.get("apps") is None
+                    or not row.get("available_devices")
+                    or not self._fleet_day_row_valid(row, chunk_end)
+                ):
+                    row = None
+
+            if row is None:
+                # Fresh event cache per day keeps memory bounded on long ranges.
+                day = calculate_user_summary_day(
+                    self,
+                    username,
+                    chunk_start,
+                    chunk_end,
+                    device_ids=device_ids,
+                    exclude_inactive_session_afk=exclude_inactive_session_afk,
+                )
+                all_cached = False
+                if complete:
+                    row = self.summary_store.upsert_user_summary(
+                        username=username,
+                        range_start=chunk_range_start,
+                        range_end=chunk_range_end,
+                        device_ids=device_ids,
+                        exclude_inactive_session_afk=exclude_inactive_session_afk,
+                        selected_devices=day["selected_devices"],
+                        totals=day["totals"],
+                        source=source,
+                        apps=day["apps"],
+                        available_devices=day["available_devices"],
+                    )
+                else:
+                    row = day
+            chunk_summaries.append(row)
+
+        merged = merge_user_summary_chunks(
             username,
             start,
             end,
-            device_ids=device_ids,
-            exclude_inactive_session_afk=exclude_inactive_session_afk,
+            exclude_inactive_session_afk,
+            chunk_summaries,
         )
-        return self.summary_store.upsert_user_summary(
-            username=username,
-            range_start=summary["range"]["start"],
-            range_end=summary["range"]["end"],
-            device_ids=device_ids,
-            exclude_inactive_session_afk=exclude_inactive_session_afk,
-            selected_devices=summary["selected_devices"],
-            totals=summary["totals"],
-            source=source,
-        )
+        merged["summary_cache"] = {
+            "cached": all_cached,
+            "calculated_at": datetime.now().astimezone().isoformat(),
+            "source": source,
+        }
+        return merged
 
     def recalculate_fleet_user_summary(
         self,
@@ -1023,14 +1274,15 @@ class ServerAPI:
         device_ids: Optional[Iterable[Any]] = None,
         exclude_inactive_session_afk=True,
     ):
-        return self.get_fleet_user_summary_value(
+        # Force a full recompute (totals AND the per-app report) so the cached
+        # detail stays coherent; returns the fresh detail payload.
+        return self.get_fleet_user(
             username,
             start=start,
             end=end,
             device_ids=device_ids,
             exclude_inactive_session_afk=exclude_inactive_session_afk,
             force=True,
-            source="manual",
         )
 
     def get_fleet_summary(
@@ -1208,22 +1460,20 @@ class ServerAPI:
         end=None,
         device_ids=None,
         exclude_inactive_session_afk=False,
+        force=False,
     ):
+        # Chunked summary: complete days come from (and are persisted to) the
+        # summary store; only missing days and the current day are computed.
         summary = self.get_fleet_user_summary_value(
             username,
             start=start,
             end=end,
             device_ids=device_ids,
             exclude_inactive_session_afk=exclude_inactive_session_afk,
+            force=force,
+            source="manual" if force else "on_demand",
         )
-        detail = summarize_user(
-            self,
-            username,
-            start,
-            end,
-            device_ids=device_ids,
-            exclude_inactive_session_afk=exclude_inactive_session_afk,
-        )
+        detail = build_user_detail_from_summary(self, username, summary)
         detail["totals"] = summary["totals"]
         detail["summary_cache"] = summary["summary_cache"]
         return detail

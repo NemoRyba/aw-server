@@ -211,6 +211,56 @@ class RedmineReadOnlySource:
             for row in rows
         ]
 
+    def daily_time_entries(
+        self,
+        *,
+        user_ids: Iterable[int],
+        spent_from: date,
+        spent_to: date,
+    ) -> List[Dict[str, Any]]:
+        """Row-level time entries (one per booking) with spent_on date,
+        project name, hours, and the entry comment."""
+        normalized_user_ids = sorted(
+            {int(user_id) for user_id in user_ids if int(user_id) > 0}
+        )
+        if not normalized_user_ids:
+            return []
+
+        time_entries_table = self._table("time_entries")
+        projects_table = self._table("projects")
+        placeholders = ", ".join(["%s"] * len(normalized_user_ids))
+        rows = self._query(
+            f"""
+            SELECT
+                te.id,
+                te.user_id,
+                te.spent_on,
+                te.project_id,
+                COALESCE(p.name, '') AS project_name,
+                te.hours,
+                COALESCE(te.comments, '') AS comments
+            FROM {time_entries_table} te
+            LEFT JOIN {projects_table} p ON p.id = te.project_id
+            WHERE te.user_id IN ({placeholders})
+                AND te.spent_on >= %s
+                AND te.spent_on <= %s
+            ORDER BY te.spent_on, te.user_id, p.name, te.id
+            """,
+            [*normalized_user_ids, spent_from.isoformat(), spent_to.isoformat()],
+        )
+        return [
+            {
+                "entry_id": _coerce_int(row.get("id")),
+                "user_id": _coerce_int(row.get("user_id")),
+                "spent_on": _date_literal(row.get("spent_on")),
+                "project_id": _coerce_int(row.get("project_id")),
+                "project_name": str(row.get("project_name") or ""),
+                "hours": _coerce_float(row.get("hours")),
+                "comments": str(row.get("comments") or ""),
+            }
+            for row in rows
+        ]
+
     def _table(self, name: str) -> str:
         prefix = str(self.config.get("table_prefix") or "").strip()
         if not re.match(r"^[A-Za-z0-9_]*$", prefix):

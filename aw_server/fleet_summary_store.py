@@ -48,6 +48,16 @@ def _row_to_summary(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
         },
         "selected_devices": json.loads(row["selected_devices_json"] or "[]"),
         "totals": json.loads(row["totals_json"]),
+        "apps": (
+            json.loads(row["apps_json"])
+            if "apps_json" in row.keys() and row["apps_json"]
+            else None
+        ),
+        "available_devices": (
+            json.loads(row["available_devices_json"])
+            if "available_devices_json" in row.keys() and row["available_devices_json"]
+            else None
+        ),
         "summary_cache": {
             "cached": True,
             "calculated_at": row["calculated_at"],
@@ -137,6 +147,22 @@ class FleetSummaryStore:
                 );
                 """
             )
+        self._migrate_columns()
+
+    def _migrate_columns(self) -> None:
+        for column, ddl in (
+            ("apps_json", "ALTER TABLE user_summary_cache ADD COLUMN apps_json TEXT"),
+            (
+                "available_devices_json",
+                "ALTER TABLE user_summary_cache ADD COLUMN available_devices_json TEXT",
+            ),
+        ):
+            try:
+                with self._conn:
+                    self._conn.execute(ddl)
+            except sqlite3.OperationalError:
+                # Column already exists.
+                pass
 
     def get_user_summary(
         self,
@@ -180,11 +206,17 @@ class FleetSummaryStore:
         selected_devices: Iterable[Any],
         totals: Dict[str, Any],
         source: str,
+        apps: Optional[List[Dict[str, Any]]] = None,
+        available_devices: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         device_ids_json = _normalize_device_ids_key(device_ids)
         calculated_at = _utcnow()
         selected_devices_json = json.dumps(sorted(str(value) for value in selected_devices))
         totals_json = json.dumps(totals, sort_keys=True)
+        apps_json = json.dumps(apps) if apps is not None else None
+        available_devices_json = (
+            json.dumps(available_devices) if available_devices is not None else None
+        )
 
         with self._lock:
             with self._conn:
@@ -199,9 +231,11 @@ class FleetSummaryStore:
                         selected_devices_json,
                         totals_json,
                         calculated_at,
-                        source
+                        source,
+                        apps_json,
+                        available_devices_json
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(
                         username,
                         range_start,
@@ -212,7 +246,12 @@ class FleetSummaryStore:
                         selected_devices_json = excluded.selected_devices_json,
                         totals_json = excluded.totals_json,
                         calculated_at = excluded.calculated_at,
-                        source = excluded.source
+                        source = excluded.source,
+                        apps_json = COALESCE(excluded.apps_json, user_summary_cache.apps_json),
+                        available_devices_json = COALESCE(
+                            excluded.available_devices_json,
+                            user_summary_cache.available_devices_json
+                        )
                     """,
                     (
                         username,
@@ -224,6 +263,8 @@ class FleetSummaryStore:
                         totals_json,
                         calculated_at,
                         source,
+                        apps_json,
+                        available_devices_json,
                     ),
                 )
 
@@ -247,12 +288,37 @@ class FleetSummaryStore:
             },
             "selected_devices": sorted(str(value) for value in selected_devices),
             "totals": totals,
+            "apps": apps,
+            "available_devices": available_devices,
             "summary_cache": {
                 "cached": False,
                 "calculated_at": calculated_at,
                 "source": source,
             },
         }
+
+    def delete_user_summaries_in_range(
+        self,
+        *,
+        range_start: str,
+        range_end: str,
+        username: Optional[str] = None,
+    ) -> int:
+        """Drop cached day/range rows overlapping [range_start, range_end).
+        Called when historical events are edited, created, or deleted so stale
+        summaries are recomputed on next access."""
+        query = """
+            DELETE FROM user_summary_cache
+            WHERE range_start < ? AND range_end > ?
+        """
+        params: List[Any] = [range_end, range_start]
+        if username:
+            query += " AND username = ?"
+            params.append(username)
+        with self._lock:
+            with self._conn:
+                cursor = self._conn.execute(query, params)
+                return cursor.rowcount
 
     def start_precompute_run(
         self,

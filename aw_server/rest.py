@@ -18,7 +18,9 @@ from flask import (
 )
 from flask_restx import Api, Resource, fields
 
+from datetime import datetime, timedelta
 from . import logger
+from .fleet import get_bucket_identity
 from .api import ServerAPI
 from .exceptions import BadRequest, Unauthorized
 from .fleet_sync import FleetSyncConflict
@@ -178,6 +180,86 @@ def _settings_user():
     return username
 
 
+def _manual_event_editor_user():
+    """Username of the logged-in person for manual event operations.
+
+    Watchers post events without a browser session and return None here —
+    their writes stay untouched. Manual UI operations carry the session
+    cookie and get audited + authorized.
+    """
+    if current_app.api.testing:
+        return None
+    username, _user = _current_auth_user()
+    return username
+
+
+def _bucket_event_username(bucket_id):
+    try:
+        bucket = current_app.api.get_buckets().get(bucket_id)
+    except Exception:
+        return None
+    if not bucket:
+        return None
+    username = str(get_bucket_identity(bucket).get("username") or "")
+    if not username or username.lower() == "unknown":
+        return None
+    return username
+
+
+def _authorize_manual_event_operation(bucket_id, editor_username):
+    """Admins may edit any event; other users only events of buckets that
+    belong to their own username (forward-compatible self-service editing)."""
+    _username, user = _current_auth_user()
+    if user and bool(user.get("is_admin", False)):
+        return
+    owner = _bucket_event_username(bucket_id)
+    if owner and editor_username and owner.lower() == editor_username.lower():
+        return
+    raise Unauthorized(
+        "EventEditForbidden",
+        "Only admins may edit events of other users",
+    )
+
+
+def _stamp_manual_event(event_dict, editor_username, is_edit):
+    data = event_dict.setdefault("data", {})
+    if not isinstance(data, dict):
+        return
+    entry = {
+        "by": editor_username,
+        "at": datetime.now().astimezone().isoformat(),
+        "action": "edited" if is_edit else "created",
+    }
+    history = data.get("$edits")
+    if not isinstance(history, list):
+        history = []
+    history.append(entry)
+    data["$edits"] = history
+    if not is_edit:
+        data["$manual"] = True
+
+
+def _manual_event_window(event_dicts, extra_events=None):
+    stamps = []
+    for source in (event_dicts or []), (extra_events or []):
+        for event in source:
+            if not event:
+                continue
+            timestamp = event.get("timestamp")
+            if isinstance(timestamp, str):
+                try:
+                    timestamp = iso8601.parse_date(timestamp)
+                except Exception:
+                    continue
+            if timestamp is None:
+                continue
+            duration = float(event.get("duration") or 0.0)
+            stamps.append((timestamp, timestamp + timedelta(seconds=duration)))
+    if not stamps:
+        return None, None
+    return min(s for s, _e in stamps), max(e for _s, e in stamps)
+
+
 def _require_admin_user():
     if current_app.api.testing:
         return {"username": "testing", "is_admin": True}
@@ -333,13 +415,39 @@ class EventsResource(Resource):
         )
 
         if isinstance(data, dict):
-            events = [Event(**data)]
+            raw_events = [data]
         elif isinstance(data, list):
-            events = [Event(**e) for e in data]
+            raw_events = list(data)
         else:
             raise BadRequest("Invalid POST data", "")
 
+        editor_username = _manual_event_editor_user()
+        previous_events = []
+        if editor_username:
+            _authorize_manual_event_operation(bucket_id, editor_username)
+            for raw_event in raw_events:
+                event_id = raw_event.get("id") if isinstance(raw_event, dict) else None
+                if event_id is not None:
+                    try:
+                        previous = current_app.api.get_event(bucket_id, int(event_id))
+                    except Exception:
+                        previous = None
+                    if previous:
+                        previous_events.append(previous)
+                _stamp_manual_event(raw_event, editor_username, event_id is not None)
+
+        events = [Event(**e) for e in raw_events]
         event = current_app.api.create_events(bucket_id, events)
+
+        if editor_username:
+            window_start, window_end = _manual_event_window(raw_events, previous_events)
+            if window_start is not None:
+                current_app.api.invalidate_fleet_user_summaries(
+                    window_start,
+                    window_end,
+                    username=_bucket_event_username(bucket_id),
+                )
+
         return event.to_json_dict() if event else None, 200
 
 
@@ -379,7 +487,25 @@ class EventResource(Resource):
                 event_id, bucket_id
             )
         )
+        editor_username = _manual_event_editor_user()
+        previous = None
+        if editor_username:
+            _authorize_manual_event_operation(bucket_id, editor_username)
+            try:
+                previous = current_app.api.get_event(bucket_id, event_id)
+            except Exception:
+                previous = None
+
         success = current_app.api.delete_event(bucket_id, event_id)
+
+        if editor_username and success and previous:
+            window_start, window_end = _manual_event_window([previous])
+            if window_start is not None:
+                current_app.api.invalidate_fleet_user_summaries(
+                    window_start,
+                    window_end,
+                    username=_bucket_event_username(bucket_id),
+                )
         return {"success": success}, 200
 
 
@@ -800,6 +926,19 @@ class FleetRedmineComparisonResource(Resource):
         data = request.get_json() or {}
         return jsonify(
             current_app.api.get_fleet_redmine_comparison(
+                start=_fleet_json_date(data, "start"),
+                end=_fleet_json_date(data, "end"),
+                usernames=data.get("usernames") or [],
+            )
+        )
+
+
+@api.route("/0/fleet/redmine-daily-comparison")
+class FleetRedmineDailyComparisonResource(Resource):
+    def post(self):
+        data = request.get_json() or {}
+        return jsonify(
+            current_app.api.get_fleet_redmine_daily_comparison(
                 start=_fleet_json_date(data, "start"),
                 end=_fleet_json_date(data, "end"),
                 usernames=data.get("usernames") or [],

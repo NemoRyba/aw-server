@@ -18,6 +18,44 @@ DEFAULT_REPORT_RANGE = timedelta(days=7)
 AGGREGATED_ACTIVITY_MAX_ROWS_PER_BIN = 120
 
 
+class FleetEventCache:
+    """Request-scoped read cache around the API.
+
+    One fleet request re-reads the same bucket event lists many times
+    (afk/session/window intervals, totals, per-app report). Fetching and
+    JSON-serializing those events from storage dominates request time, so this
+    proxy memoizes get_buckets() and get_events() results for the lifetime of
+    a single request. Never keep an instance across requests.
+    """
+
+    def __init__(self, api):
+        self._api = api
+        self._buckets = None
+        self._events = {}
+
+    def __getattr__(self, name):
+        return getattr(self._api, name)
+
+    def get_buckets(self):
+        if self._buckets is None:
+            self._buckets = self._api.get_buckets()
+        return self._buckets
+
+    def get_events(self, bucket_id, limit=-1, start=None, end=None):
+        key = (bucket_id, limit, start, end)
+        if key not in self._events:
+            self._events[key] = self._api.get_events(
+                bucket_id, limit=limit, start=start, end=end
+            )
+        return self._events[key]
+
+
+def wrap_fleet_event_cache(api):
+    if isinstance(api, FleetEventCache):
+        return api
+    return FleetEventCache(api)
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -40,6 +78,206 @@ def _isoformat(value: Optional[datetime]) -> Optional[str]:
 
 def format_fleet_datetime(value: Optional[datetime]) -> Optional[str]:
     return _isoformat(value)
+
+
+def parse_fleet_datetime(value: Optional[Any]) -> Optional[datetime]:
+    return _parse_datetime(value)
+
+
+def local_fleet_day_boundary(day, hour: int, minute: int) -> datetime:
+    """Return the aware instant for local wall-clock `day` at hour:minute.
+
+    Uses naive-datetime.astimezone(), which interprets the naive value as
+    system-local wall time with the correct UTC offset FOR THAT DATE, so
+    boundaries stay at e.g. 04:00 local across DST changes.
+    """
+    return datetime(day.year, day.month, day.day, hour, minute).astimezone()
+
+
+def parse_start_of_day(start_of_day: str) -> Tuple[int, int]:
+    try:
+        hour_text, minute_text = str(start_of_day or "04:00").split(":", 1)
+        hour, minute = int(hour_text), int(minute_text)
+    except (TypeError, ValueError):
+        return 4, 0
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return 4, 0
+    return hour, minute
+
+
+def iter_fleet_day_ranges(
+    start: datetime, end: datetime, start_of_day: str
+) -> List[Tuple[datetime, datetime]]:
+    """Split [start, end) into consecutive chunks at local start_of_day
+    boundaries. Ranges the webui sends (aligned to start_of_day) split into
+    exact fleet days; unaligned edges become partial chunks."""
+    hour, minute = parse_start_of_day(start_of_day)
+    chunks: List[Tuple[datetime, datetime]] = []
+    cur = start
+    # Hard safety bound: ~11 years of days.
+    for _ in range(4096):
+        if cur >= end:
+            break
+        local = cur.astimezone()
+        boundary = local_fleet_day_boundary(local.date(), hour, minute)
+        if boundary <= cur:
+            boundary = local_fleet_day_boundary(
+                local.date() + timedelta(days=1), hour, minute
+            )
+        nxt = min(boundary, end)
+        chunks.append((cur, nxt))
+        cur = nxt
+    return chunks
+
+
+def _aggregate_apps_rows(
+    rows: Iterable[Dict[str, Any]],
+    available_device_catalog: Dict[str, str],
+) -> List[Dict[str, Any]]:
+    apps_by_name: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        item = apps_by_name.setdefault(
+            row["app"],
+            {
+                "app": row["app"],
+                "seconds": 0.0,
+                "active_seconds": 0.0,
+                "afk_seconds": 0.0,
+                "devices": set(),
+            },
+        )
+        item["seconds"] += row["seconds"]
+        item["active_seconds"] += row["active_seconds"]
+        item["afk_seconds"] += row["afk_seconds"]
+        item["devices"].add(row["device_id"])
+        available_device_catalog.setdefault(row["device_id"], row["device_name"])
+
+    return [
+        {
+            "app": item["app"],
+            "seconds": item["seconds"],
+            "active_seconds": item["active_seconds"],
+            "afk_seconds": item["afk_seconds"],
+            "devices": sorted(item["devices"]),
+        }
+        for item in sorted(
+            apps_by_name.values(), key=lambda item: item["seconds"], reverse=True
+        )
+    ]
+
+
+def calculate_user_summary_day(
+    api,
+    username: str,
+    start: datetime,
+    end: datetime,
+    device_ids: Optional[Iterable[str]] = None,
+    exclude_inactive_session_afk: bool = False,
+) -> Dict[str, Any]:
+    """Compute one chunk (typically one fleet day): totals AND the per-app
+    report, sharing a single event cache so each bucket's events for the day
+    are fetched exactly once."""
+    api = wrap_fleet_event_cache(api)
+    summary = calculate_user_summary_totals(
+        api,
+        username,
+        start,
+        end,
+        device_ids=device_ids,
+        exclude_inactive_session_afk=exclude_inactive_session_afk,
+    )
+    available_device_catalog = {
+        device["device_id"]: device["device_name"]
+        for device in summary["available_devices"]
+    }
+    apps_report = report_time_by_app(
+        api,
+        username=username,
+        device_ids=list(summary["selected_devices"]),
+        start=start,
+        end=end,
+        exclude_inactive_session_afk=exclude_inactive_session_afk,
+    )
+    summary["apps"] = _aggregate_apps_rows(
+        apps_report["rows"], available_device_catalog
+    )
+    summary["available_devices"] = _user_available_devices_payload(
+        available_device_catalog
+    )
+    summary["devices"] = sorted(available_device_catalog)
+    return summary
+
+
+def merge_user_summary_chunks(
+    username: str,
+    start: datetime,
+    end: datetime,
+    exclude_inactive_session_afk: bool,
+    chunks: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Merge per-day summaries into one range summary. Interval math is
+    time-local, so per-day merged durations sum exactly to the whole-range
+    values; app rows and device catalogs merge additively."""
+    totals: Dict[str, float] = {}
+    catalog: Dict[str, str] = {}
+    selected: Set[str] = set()
+    apps_by_name: Dict[str, Dict[str, Any]] = {}
+
+    for chunk in chunks:
+        for key, value in (chunk.get("totals") or {}).items():
+            totals[key] = totals.get(key, 0.0) + float(value or 0.0)
+        for device in chunk.get("available_devices") or []:
+            device_id = device.get("device_id")
+            if not device_id:
+                continue
+            name = device.get("device_name")
+            if device_id not in catalog or (name and name != device_id):
+                catalog.setdefault(device_id, name or device_id)
+                if name and name != device_id:
+                    catalog[device_id] = name
+        for device_id in chunk.get("selected_devices") or []:
+            selected.add(str(device_id))
+        for row in chunk.get("apps") or []:
+            item = apps_by_name.setdefault(
+                row["app"],
+                {
+                    "app": row["app"],
+                    "seconds": 0.0,
+                    "active_seconds": 0.0,
+                    "afk_seconds": 0.0,
+                    "devices": set(),
+                },
+            )
+            item["seconds"] += float(row.get("seconds") or 0.0)
+            item["active_seconds"] += float(row.get("active_seconds") or 0.0)
+            item["afk_seconds"] += float(row.get("afk_seconds") or 0.0)
+            item["devices"].update(row.get("devices") or [])
+
+    apps = [
+        {
+            "app": item["app"],
+            "seconds": item["seconds"],
+            "active_seconds": item["active_seconds"],
+            "afk_seconds": item["afk_seconds"],
+            "devices": sorted(item["devices"]),
+        }
+        for item in sorted(
+            apps_by_name.values(), key=lambda item: item["seconds"], reverse=True
+        )
+    ]
+
+    return {
+        "username": username,
+        "range": {"start": _isoformat(start), "end": _isoformat(end)},
+        "filters": {
+            "exclude_inactive_session_afk": exclude_inactive_session_afk,
+        },
+        "devices": sorted(catalog),
+        "available_devices": _user_available_devices_payload(catalog),
+        "selected_devices": sorted(selected),
+        "totals": totals,
+        "apps": apps,
+    }
 
 
 def normalize_fleet_range(
@@ -695,6 +933,7 @@ def summarize_device_metrics(
     device_ids: Optional[Iterable[str]] = None,
     max_points: int = 180,
 ) -> Dict[str, Any]:
+    api = wrap_fleet_event_cache(api)
     start, end = _normalize_range(start, end)
     selected_device_ids = _normalize_device_ids(device_ids=device_ids)
     devices: Dict[str, Dict[str, Any]] = {}
@@ -1408,6 +1647,7 @@ def summarize_user_activity(
     exclude_inactive_session_afk: bool = False,
     max_rows_per_bin: int = AGGREGATED_ACTIVITY_MAX_ROWS_PER_BIN,
 ) -> Dict[str, Any]:
+    api = wrap_fleet_event_cache(api)
     start, end = _normalize_range(start, end)
     selected_device_ids = _normalize_device_ids(device_ids=device_ids)
     bin_unit, bins = _timeline_bins(start, end)
@@ -1631,6 +1871,7 @@ def report_time_by_app(
     app_contains: Optional[str] = None,
     exclude_inactive_session_afk: bool = False,
 ) -> Dict[str, Any]:
+    api = wrap_fleet_event_cache(api)
     start, end = _normalize_range(start, end)
     selected_device_ids = _normalize_device_ids(device_id=device_id, device_ids=device_ids)
     afk_intervals = _load_afk_intervals(
@@ -1795,6 +2036,7 @@ def calculate_user_summary_totals(
     device_ids: Optional[Iterable[str]] = None,
     exclude_inactive_session_afk: bool = False,
 ) -> Dict[str, Any]:
+    api = wrap_fleet_event_cache(api)
     start, end = _normalize_range(start, end)
     available_device_catalog, selected_device_ids = _resolve_user_device_selection(
         api,
@@ -1856,6 +2098,41 @@ def calculate_user_summary_totals(
     }
 
 
+def build_user_detail_from_summary(api, username: str, summary: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the user detail payload from a fully cached summary (totals + apps +
+    available_devices) without scanning any events; only live session state is read."""
+    api = wrap_fleet_event_cache(api)
+    live = summarize_live_state(api)
+    selected_device_ids = [str(value) for value in (summary.get("selected_devices") or [])]
+    selected_device_set = set(selected_device_ids)
+    sessions = [
+        session
+        for session in live["users"]
+        if session["username"] == username
+        and (not selected_device_ids or session["device_id"] in selected_device_set)
+    ]
+    available_devices = list(summary.get("available_devices") or [])
+    available_device_catalog = {
+        device["device_id"]: device["device_name"] for device in available_devices
+    }
+
+    return {
+        "username": username,
+        "range": dict(summary.get("range") or {}),
+        "filters": {
+            "exclude_inactive_session_afk": bool(
+                (summary.get("filters") or {}).get("exclude_inactive_session_afk")
+            ),
+        },
+        "devices": sorted(available_device_catalog),
+        "available_devices": _user_available_devices_payload(available_device_catalog),
+        "selected_devices": sorted(selected_device_ids),
+        "totals": summary["totals"],
+        "apps": list(summary.get("apps") or []),
+        "sessions": sessions,
+    }
+
+
 def summarize_user(
     api,
     username: str,
@@ -1863,23 +2140,38 @@ def summarize_user(
     end: Optional[datetime],
     device_ids: Optional[Iterable[str]] = None,
     exclude_inactive_session_afk: bool = False,
+    precomputed_summary: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    api = wrap_fleet_event_cache(api)
     start, end = _normalize_range(start, end)
     live = summarize_live_state(api)
     all_sessions = [session for session in live["users"] if session["username"] == username]
-    summary = calculate_user_summary_totals(
-        api,
-        username,
-        start,
-        end,
-        device_ids=device_ids,
-        exclude_inactive_session_afk=exclude_inactive_session_afk,
-    )
-    available_device_catalog = {
-        device["device_id"]: device["device_name"]
-        for device in summary["available_devices"]
-    }
-    selected_device_ids = list(summary["selected_devices"])
+    summary = precomputed_summary
+    if summary is None:
+        summary = calculate_user_summary_totals(
+            api,
+            username,
+            start,
+            end,
+            device_ids=device_ids,
+            exclude_inactive_session_afk=exclude_inactive_session_afk,
+        )
+    if summary.get("available_devices"):
+        available_device_catalog = {
+            device["device_id"]: device["device_name"]
+            for device in summary["available_devices"]
+        }
+        selected_device_ids = list(summary["selected_devices"])
+    else:
+        # Totals-only cache entries (e.g. from nightly precompute) do not carry
+        # the device catalog; resolve it from events (shared via the event cache).
+        available_device_catalog, selected_device_ids = _resolve_user_device_selection(
+            api,
+            username=username,
+            start=start,
+            end=end,
+            device_ids=device_ids,
+        )
 
     selected_device_set = set(selected_device_ids)
     sessions = [
@@ -1954,6 +2246,7 @@ def summarize_device(
     end: Optional[datetime],
     exclude_inactive_session_afk: bool = False,
 ) -> Dict[str, Any]:
+    api = wrap_fleet_event_cache(api)
     start, end = _normalize_range(start, end)
     live = summarize_live_state(api)
     device = next(
