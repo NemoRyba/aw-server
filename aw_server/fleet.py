@@ -4,6 +4,7 @@ from math import ceil
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import iso8601
+from aw_core.identity import normalize_session_state, normalize_session_type
 
 WATCHER_KIND_BY_TYPE = {
     "currentwindow": "window",
@@ -451,7 +452,11 @@ def get_bucket_identity(bucket: Dict[str, Any]) -> Dict[str, Any]:
     device_name = str(data.get("device_name") or hostname or device_id)
     username = str(data.get("username") or "unknown")
     session_id = str(data.get("session_id") or "unknown")
-    session_type = str(data.get("session_type") or "interactive")
+    # Read-side normalization: buckets written by older watchers carry the
+    # placeholder "interactive" for sessions the session watcher labelled
+    # "console"/"rdp". Normalizing here (and in _merge_identity below) makes
+    # all stored history render under one vocabulary with no data migration.
+    session_type = normalize_session_type(data.get("session_type"))
 
     return {
         "username": username,
@@ -481,8 +486,19 @@ def _merge_identity(
         "domain",
         "hostname",
     ):
-        if data.get(key) not in (None, ""):
-            merged[key] = str(data[key]) if key != "domain" else data[key]
+        if data.get(key) in (None, ""):
+            continue
+        if key == "domain":
+            merged[key] = data[key]
+        elif key == "session_type":
+            # An event-level "interactive" must not overwrite a bucket-level
+            # "console" - normalizing first turns it into "unknown", which the
+            # guard below then discards.
+            normalized = normalize_session_type(data[key])
+            if normalized != "unknown" or merged.get(key) in (None, "", "unknown"):
+                merged[key] = normalized
+        else:
+            merged[key] = str(data[key])
     return merged
 
 
@@ -627,11 +643,23 @@ def summarize_live_state(api) -> Dict[str, Any]:
         ):
             session["_last_updated_dt"] = updated
 
+        # The session watcher is the authority on the session type; without
+        # this the value came from whichever bucket the dict iteration reached
+        # first, so the same RDP session reported "rdp" or "unknown" at random.
+        candidate_type = normalize_session_type(snapshot.get("session_type"))
+        if snapshot["kind"] == "session":
+            if candidate_type != "unknown":
+                session["session_type"] = candidate_type
+        elif session.get("session_type") in (None, "", "unknown"):
+            session["session_type"] = candidate_type
+
         if snapshot["kind"] == "session" and _is_newer_update(
             session["_session_updated_dt"], updated
         ):
             session["_session_updated_dt"] = updated
-            session["session_state"] = data.get("state") or session["session_state"]
+            session["session_state"] = (
+                normalize_session_state(data.get("state")) or session["session_state"]
+            )
             session["session_reason"] = data.get("reason") or session["session_reason"]
         elif snapshot["kind"] == "afk" and _is_newer_update(
             session["_afk_updated_dt"], updated
@@ -833,19 +861,75 @@ def summarize_users(api) -> Dict[str, Any]:
 
 
 def summarize_devices(api) -> Dict[str, Any]:
+    """Every device the fleet has ever heard from, not just the live ones.
+
+    This used to list only devices with a session updated in the last two
+    minutes, so a PC that was switched off simply vanished from Geraete - and
+    with it the only link into its historical data. Offline devices are now
+    listed with status "offline", their last-seen time and the users last seen
+    on them, so they stay clickable.
+    """
+    api = wrap_fleet_event_cache(api)
     live = summarize_live_state(api)
+    live_by_device = {device["device_id"]: device for device in live["devices"]}
+
+    # _load_live_snapshots walks every watcher bucket (one latest_event each),
+    # so it already knows about devices that have long gone quiet. It shares
+    # the request-scoped cache with summarize_live_state above, so this is not
+    # a second pass over the datastore.
+    known: Dict[str, Dict[str, Any]] = {}
+    for snapshot in _load_live_snapshots(api):
+        device_id = str(snapshot.get("device_id") or "")
+        if not device_id or device_id.lower() == "unknown":
+            continue
+        entry = known.setdefault(
+            device_id,
+            {
+                "device_id": device_id,
+                "device_name": device_id,
+                "last_seen": None,
+                "users": set(),
+            },
+        )
+        device_name = str(snapshot.get("device_name") or "")
+        if device_name and device_name.lower() != "unknown":
+            entry["device_name"] = device_name
+        username = str(snapshot.get("username") or "")
+        if username and username.lower() != "unknown":
+            entry["users"].add(username)
+        last_updated = snapshot.get("last_updated")
+        if last_updated is not None and (
+            entry["last_seen"] is None or last_updated > entry["last_seen"]
+        ):
+            entry["last_seen"] = last_updated
+
     rows = []
-    for device in live["devices"]:
+    for device_id, entry in known.items():
+        live_device = live_by_device.get(device_id)
+        if live_device:
+            rows.append(
+                {
+                    "device_id": device_id,
+                    "device_name": live_device["device_name"],
+                    "status": live_device["status"],
+                    "users": list(live_device["users_logged_in"]),
+                    "last_seen": live_device["last_updated"],
+                    "session_count": len(live_device["sessions"]),
+                }
+            )
+            continue
         rows.append(
             {
-                "device_id": device["device_id"],
-                "device_name": device["device_name"],
-                "status": device["status"],
-                "users": list(device["users_logged_in"]),
-                "last_seen": device["last_updated"],
-                "session_count": len(device["sessions"]),
+                "device_id": device_id,
+                "device_name": entry["device_name"],
+                "status": "offline",
+                # Last known users, so an offline row still says whose PC it is.
+                "users": sorted(entry["users"]),
+                "last_seen": _isoformat(entry["last_seen"]),
+                "session_count": 0,
             }
         )
+
     rows = sorted(rows, key=lambda item: item["device_name"] or item["device_id"])
     return {"devices": rows}
 
@@ -1023,6 +1107,35 @@ def _matching_buckets(
         if username is not None and classification["username"] not in (username, "unknown"):
             continue
         yield classification
+
+
+def _users_seen_on_device(
+    api,
+    *,
+    device_id: str,
+    start: datetime,
+    end: datetime,
+) -> Set[str]:
+    """Usernames with watcher activity on one device inside a range.
+
+    Runs inside the request-scoped event cache, so the buckets it touches are
+    the same ones the totals and the app report already read - it costs no
+    extra datastore work.
+    """
+    users: Set[str] = set()
+    for bucket in _matching_buckets(api, device_id=device_id):
+        events = api.get_events(bucket["bucket_id"], limit=-1, start=start, end=end)
+        if not events:
+            continue
+        # In central mode a bucket belongs to exactly one user/session, so the
+        # bucket identity is enough; only fall back to event-level identity for
+        # buckets whose metadata is still stale.
+        username = str(bucket.get("username") or "")
+        if not username or username.lower() == "unknown":
+            username = str(_event_identity(bucket, events[0]).get("username") or "")
+        if username and username.lower() != "unknown":
+            users.add(username)
+    return users
 
 
 def _sum_bucket_event_seconds(
@@ -1315,7 +1428,9 @@ def _load_session_state_intervals(
             if not _matches_device_filter(identity["device_id"], selected_device_ids):
                 continue
 
-            state = str(dict(event.get("data") or {}).get("state") or "").strip()
+            state = normalize_session_state(
+                dict(event.get("data") or {}).get("state")
+            )
             if not state:
                 continue
 
@@ -2253,7 +2368,14 @@ def summarize_device(
         (device for device in live["devices"] if device["device_id"] == device_id), None
     )
     sessions = device["sessions"] if device else []
-    users = sorted({session["username"] for session in sessions})
+    # Users who actually worked on this device in the SELECTED RANGE, unioned
+    # with whoever is logged in right now. Deriving this from the live state
+    # alone was wrong: live only keeps sessions updated within the last two
+    # minutes, so opening a device for any past range listed no users at all.
+    users = sorted(
+        {session["username"] for session in sessions}
+        | _users_seen_on_device(api, device_id=device_id, start=start, end=end)
+    )
     active_session_intervals = None
     known_session_keys = None
     if exclude_inactive_session_afk:

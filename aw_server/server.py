@@ -1,5 +1,6 @@
 import logging
 import os
+from hmac import compare_digest
 from datetime import datetime, timedelta
 from typing import Dict, List
 
@@ -54,22 +55,59 @@ def _is_bucket_write_request(path: str, method: str) -> bool:
     return False
 
 
+# Paths reachable with no credentials at all. /0/info stays open because every
+# aw-client uses it as the "is the server up?" probe before it can authenticate.
+PUBLIC_API_PATHS = {
+    "/api/0/info",
+    "/api/0/auth/login",
+    "/api/0/auth/session",
+    "/api/0/auth/logout",
+    # Enrollment is unauthenticated by definition: it is how a device that has
+    # no credential yet asks for one. Enrolling grants nothing on its own - the
+    # device stays "pending" and can write no data until an admin approves it,
+    # and the number of pending devices is capped.
+    "/api/0/fleet/enroll",
+    "/api/0/fleet/enroll/status",
+}
+
+# Machine-to-machine endpoints: no browser session exists for these, so they
+# authenticate with the fleet token instead (see _enforce_api_auth).
+MACHINE_API_PATHS = {
+    "/api/0/fleet/sync/handshake": {"POST"},
+    "/api/0/fleet/sync/batch": {"POST"},
+    "/api/0/fleet/watcher-update/manifest": {"GET"},
+    "/api/0/fleet/watcher-update/payload": {"GET"},
+    "/api/0/fleet/watcher-update/installer": {"GET"},
+    "/api/0/fleet/watcher-update/status": {"POST"},
+}
+
+
 def _is_public_api_request(path: str, method: str) -> bool:
     if method == "OPTIONS":
         return True
+    return path in PUBLIC_API_PATHS
 
-    if path in {
-        "/api/0/info",
-        "/api/0/auth/login",
-        "/api/0/auth/session",
-        "/api/0/auth/logout",
-    }:
+
+def _is_machine_api_request(path: str, method: str) -> bool:
+    """Watcher ingest, watcher self-update and fleet sync.
+
+    These are called by the watchers and by the SYSTEM supervisor task, which
+    never hold a browser session. Before this existed the watcher-update paths
+    fell through to the session check and every supervisor poll was answered
+    with 401, so auto-update could never have worked in the field.
+    """
+    if method in MACHINE_API_PATHS.get(path, ()):
         return True
-
-    if path in {"/api/0/fleet/sync/handshake", "/api/0/fleet/sync/batch"} and method == "POST":
-        return True
-
     return _is_bucket_write_request(path, method)
+
+
+def _bearer_token() -> str:
+    header = request.headers.get("Authorization", "")
+    if header.lower().startswith("bearer "):
+        return header[7:].strip()
+    # Fallback header for callers that cannot set Authorization (some
+    # PowerShell/proxy paths strip it).
+    return request.headers.get("X-AW-Fleet-Token", "").strip()
 
 
 class AWFlask(Flask):
@@ -122,6 +160,8 @@ class AWFlask(Flask):
         self.register_error_handler(404, self._handle_not_found)
 
     def _enforce_api_auth(self):
+        """Every /api route needs either a logged-in browser session (local or
+        LDAP account) or, for machine endpoints, the fleet token."""
         if self.api.testing:
             return None
 
@@ -132,8 +172,31 @@ class AWFlask(Flask):
         if _is_public_api_request(path, request.method):
             return None
 
+        # A logged-in user may call anything; per-page authorization for
+        # non-admins happens further in, in rest._authorize_fleet_page.
         if session.get("aw_auth_user"):
             return None
+
+        if _is_machine_api_request(path, request.method):
+            if not self.api.is_watcher_token_required():
+                # Enforcement is off: the fleet is still on the pre-token
+                # watcher build, so machine traffic passes as before.
+                return None
+            # Either the shared fleet token or an approved device's own key.
+            if self.api.is_machine_credential_valid(_bearer_token()):
+                return None
+            logger.warning(
+                "Rejected unauthenticated machine request %s %s from %s",
+                request.method,
+                path,
+                request.remote_addr,
+            )
+            return jsonify(
+                {
+                    "type": "WatcherTokenRequired",
+                    "message": "A valid fleet token is required for this endpoint",
+                }
+            ), 401
 
         return jsonify(
             {

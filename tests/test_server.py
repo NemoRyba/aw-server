@@ -1340,6 +1340,8 @@ def test_admin_ui_config_endpoint(flask_client):
     assert config_r.json == {
         "show_stopwatch_menu": False,
         "show_tools_menu": True,
+        "landing_page_admin": "/fleet",
+        "landing_page_user": "/fleet",
     }
 
     update_r = flask_client.post(
@@ -1353,8 +1355,367 @@ def test_admin_ui_config_endpoint(flask_client):
     assert update_r.json == {
         "show_stopwatch_menu": True,
         "show_tools_menu": False,
+        "landing_page_admin": "/fleet",
+        "landing_page_user": "/fleet",
     }
 
     updated_r = flask_client.get("/api/0/admin/ui-config")
     assert updated_r.status_code == 200
     assert updated_r.json == update_r.json
+
+
+#
+# Session type normalization
+#
+
+
+def test_session_type_normalization_is_shared_by_all_watchers():
+    from aw_core.identity import (
+        normalize_session_state,
+        normalize_session_type,
+        session_type_from_protocol,
+    )
+
+    # The placeholder the afk/window watchers used to ship was never a session
+    # type - it collapses to "unknown" so it can never contradict the real
+    # value the session watcher reports for the same session.
+    assert normalize_session_type("interactive") == "unknown"
+    assert normalize_session_type("") == "unknown"
+    assert normalize_session_type(None) == "unknown"
+    assert normalize_session_type("Console") == "console"
+    assert normalize_session_type("RDP-Tcp") == "rdp"
+    assert normalize_session_type("citrix") == "virtual"
+    assert normalize_session_type("machine") == "machine"
+    assert normalize_session_type("something-new") == "unknown"
+
+    assert session_type_from_protocol(0) == "console"
+    assert session_type_from_protocol(1) == "virtual"
+    assert session_type_from_protocol(2) == "rdp"
+    assert session_type_from_protocol(None) == "unknown"
+
+    assert normalize_session_state("logged_off") == "no_session"
+    assert normalize_session_state("not-afk") == "active"
+    assert normalize_session_state(" LOCKED ") == "locked"
+
+
+def test_bucket_identity_normalizes_legacy_session_type():
+    from aw_server.fleet import _merge_identity, get_bucket_identity
+
+    bucket = {
+        "hostname": "PC-01",
+        "data": {
+            "username": "mstep",
+            "device_id": "PC-01",
+            "session_id": "2",
+            "session_type": "console",
+        },
+    }
+    identity = get_bucket_identity(bucket)
+    assert identity["session_type"] == "console"
+
+    # An afk/window event carrying the old placeholder must not overwrite the
+    # precise value - that is what produced "2 (console)" next to
+    # "2 (interactive)" for one physical session.
+    merged = _merge_identity(identity, {"data": {"session_type": "interactive"}})
+    assert merged["session_type"] == "console"
+
+    # A real value still wins.
+    merged = _merge_identity(identity, {"data": {"session_type": "rdp"}})
+    assert merged["session_type"] == "rdp"
+
+    legacy = get_bucket_identity({"hostname": "PC-02", "data": {"session_type": "interactive"}})
+    assert legacy["session_type"] == "unknown"
+
+
+#
+# API auth classification
+#
+
+
+def test_machine_endpoints_are_separated_from_session_endpoints():
+    from aw_server.server import _is_machine_api_request, _is_public_api_request
+
+    # Watcher ingest and the supervisor's own update poll are machine traffic.
+    assert _is_machine_api_request("/api/0/buckets/some-bucket", "POST")
+    assert _is_machine_api_request("/api/0/buckets/some-bucket/heartbeat", "POST")
+    assert _is_machine_api_request("/api/0/buckets/some-bucket/events", "POST")
+    assert _is_machine_api_request("/api/0/fleet/watcher-update/manifest", "GET")
+    assert _is_machine_api_request("/api/0/fleet/watcher-update/payload", "GET")
+    assert _is_machine_api_request("/api/0/fleet/watcher-update/status", "POST")
+    assert _is_machine_api_request("/api/0/fleet/sync/batch", "POST")
+
+    # Everything a browser reads requires a login, with no token bypass.
+    for path in (
+        "/api/0/fleet/live",
+        "/api/0/fleet/users",
+        "/api/0/fleet/summary",
+        "/api/0/fleet/devices",
+        "/api/0/buckets/",
+        "/api/0/buckets/some-bucket/events",
+        "/api/0/query/",
+        "/api/0/export",
+        "/api/0/settings",
+        "/api/0/fleet/watcher-update/devices",
+        "/api/0/fleet/watcher-update/request",
+    ):
+        method = "GET" if not path.endswith(("query/", "request")) else "POST"
+        assert not _is_machine_api_request(path, method), path
+        assert not _is_public_api_request(path, method), path
+
+    # Only the liveness probe, the login flow and enrollment are open.
+    assert _is_public_api_request("/api/0/info", "GET")
+    assert _is_public_api_request("/api/0/auth/login", "POST")
+
+    # Enrollment must be open - it is how a device with no credential asks for
+    # one - but it grants nothing until an admin approves the device.
+    assert _is_public_api_request("/api/0/fleet/enroll", "POST")
+    assert _is_public_api_request("/api/0/fleet/enroll/status", "GET")
+
+    # Approving devices and announcing a server move stay admin-only.
+    assert not _is_public_api_request("/api/0/fleet/devices/enrollment", "GET")
+    assert not _is_machine_api_request("/api/0/fleet/devices/enrollment", "POST")
+    assert not _is_public_api_request("/api/0/admin/fleet-endpoint", "POST")
+    assert not _is_machine_api_request("/api/0/admin/fleet-endpoint", "POST")
+
+
+def test_fleet_device_lists_users_for_a_past_range(flask_client):
+    """A device opened for a HISTORICAL range must list who worked on it.
+
+    Regression: the user list was derived from the live state, which only keeps
+    sessions updated within the last two minutes, so any past range showed no
+    users at all.
+    """
+    suffix = str(random.randint(0, 10**6))
+    username = f"pastuser-{suffix}"
+    device_id = f"pc-{suffix}"
+    hostname = f"host-{suffix}"
+    metadata = {
+        "username": username,
+        "device_id": device_id,
+        "device_name": hostname,
+        "session_id": "1",
+        "session_type": "console",
+    }
+    bucket_id = f"aw-watcher-window__{device_id}__{username}__1"
+
+    # Deliberately far outside the live window.
+    now = datetime.now(timezone.utc)
+    long_ago = now - timedelta(days=3)
+    start = long_ago - timedelta(hours=1)
+    end = long_ago + timedelta(hours=1)
+
+    try:
+        _create_bucket(flask_client, bucket_id, "currentwindow", hostname, metadata)
+        _create_event(
+            flask_client,
+            bucket_id,
+            long_ago,
+            120,
+            {**metadata, "app": "Inventor.exe", "title": "part", "state": "active"},
+        )
+
+        device_r = flask_client.get(
+            f"/api/0/fleet/devices/{device_id}?start={start.isoformat()}&end={end.isoformat()}"
+        )
+        assert device_r.status_code == 200
+        assert username in device_r.json["users"]
+
+        # A range with no activity must not invent users.
+        quiet_start = now - timedelta(days=30)
+        quiet_end = now - timedelta(days=29)
+        quiet_r = flask_client.get(
+            f"/api/0/fleet/devices/{device_id}"
+            f"?start={quiet_start.isoformat()}&end={quiet_end.isoformat()}"
+        )
+        assert quiet_r.status_code == 200
+        assert username not in quiet_r.json["users"]
+    finally:
+        _delete_bucket(flask_client, bucket_id)
+
+
+#
+# "Eigene Zusammenfassung": the summary page restricted to the user's own row
+#
+
+
+def _login_as(flask_client, username, allowed_pages, is_admin=False):
+    """Register an auth user and put them in the session."""
+    settings = flask_client.application.api.settings
+    users = settings.data.setdefault(settings.AUTH_USERS_KEY, {})
+    users[username] = {
+        "password_hash": "pbkdf2:sha256:dummy",
+        "is_admin": is_admin,
+        "source": "local",
+        "allowed_pages": list(allowed_pages),
+    }
+    with flask_client.session_transaction() as session:
+        session["aw_auth_user"] = username
+
+
+def _logout(flask_client):
+    with flask_client.session_transaction() as session:
+        session.pop("aw_auth_user", None)
+
+
+def _seed_summary_user(flask_client, username, device_id, hostname):
+    metadata = {
+        "username": username,
+        "device_id": device_id,
+        "device_name": hostname,
+        "session_id": "1",
+        "session_type": "console",
+    }
+    bucket_id = f"aw-watcher-session__{device_id}__{username}__1"
+    _create_bucket(flask_client, bucket_id, "sessionstate", hostname, metadata)
+    _create_event(
+        flask_client,
+        bucket_id,
+        datetime.now(timezone.utc) - timedelta(minutes=30),
+        600,
+        {**metadata, "state": "active"},
+    )
+    return bucket_id
+
+
+def test_own_summary_grant_cannot_see_other_users(flask_client):
+    suffix = str(random.randint(0, 10**6))
+    me = f"ownsum-{suffix}"
+    other = f"othersum-{suffix}"
+    buckets = []
+    try:
+        buckets.append(_seed_summary_user(flask_client, me, f"pc-a-{suffix}", f"host-a-{suffix}"))
+        buckets.append(
+            _seed_summary_user(flask_client, other, f"pc-b-{suffix}", f"host-b-{suffix}")
+        )
+
+        _login_as(flask_client, me, ["fleet-summary-own"])
+
+        # Even when explicitly asking for somebody else, the answer is scoped
+        # to the caller - the restriction cannot be phrased away.
+        r = flask_client.get(f"/api/0/fleet/summary?usernames={other}")
+        assert r.status_code == 200
+        returned = {row["username"] for row in r.json["users"]}
+        assert other not in returned
+        assert returned <= {me}
+
+        # Asking for nobody in particular is scoped the same way.
+        r = flask_client.get("/api/0/fleet/summary")
+        assert r.status_code == 200
+        assert {row["username"] for row in r.json["users"]} <= {me}
+
+        # Recomputing is scoped too - it must not be usable to churn the whole
+        # fleet on someone else's behalf.
+        r = flask_client.post(
+            "/api/0/fleet/summary/precompute", json={"usernames": [other], "force": True}
+        )
+        assert r.status_code == 200
+
+        # NOTE: the server-wide precompute settings are admin-only in
+        # production, but _require_admin_user() short-circuits to "is admin"
+        # whenever api.testing is set, so that gate cannot be asserted from
+        # this harness - it is why no admin endpoint is covered here.
+    finally:
+        _logout(flask_client)
+        for bucket_id in buckets:
+            _delete_bucket(flask_client, bucket_id)
+
+
+def test_full_summary_grant_is_not_restricted(flask_client):
+    suffix = str(random.randint(0, 10**6))
+    me = f"fullsum-{suffix}"
+    other = f"peer-{suffix}"
+    buckets = []
+    try:
+        buckets.append(_seed_summary_user(flask_client, me, f"pc-c-{suffix}", f"host-c-{suffix}"))
+        buckets.append(
+            _seed_summary_user(flask_client, other, f"pc-d-{suffix}", f"host-d-{suffix}")
+        )
+
+        _login_as(flask_client, me, ["fleet-summary"])
+        r = flask_client.get(f"/api/0/fleet/summary?usernames={other}")
+        assert r.status_code == 200
+        assert {row["username"] for row in r.json["users"]} == {other}
+    finally:
+        _logout(flask_client)
+        for bucket_id in buckets:
+            _delete_bucket(flask_client, bucket_id)
+
+
+def test_summary_needs_one_of_the_two_grants(flask_client):
+    suffix = str(random.randint(0, 10**6))
+    me = f"nosum-{suffix}"
+    try:
+        _login_as(flask_client, me, ["fleet-live"])
+        assert flask_client.get("/api/0/fleet/summary").status_code == 401
+        assert (
+            flask_client.post("/api/0/fleet/redmine-comparison", json={}).status_code == 401
+        )
+    finally:
+        _logout(flask_client)
+
+
+def test_devices_list_includes_offline_devices(flask_client):
+    """A switched-off PC must stay in Geraete so its history is reachable.
+
+    Regression: the list was built from the live state (a two-minute window),
+    so any device that was not currently reporting disappeared entirely - and
+    with it the only link to its historical data.
+    """
+    suffix = str(random.randint(0, 10**6))
+    username = f"offlineuser-{suffix}"
+    device_id = f"pc-off-{suffix}"
+    hostname = f"host-off-{suffix}"
+    metadata = {
+        "username": username,
+        "device_id": device_id,
+        "device_name": hostname,
+        "session_id": "1",
+        "session_type": "console",
+    }
+    bucket_ids = [
+        f"aw-watcher-session__{device_id}__{username}__1",
+        f"aw-watcher-window__{device_id}__{username}__1",
+    ]
+
+    # Far outside the live window: this device is "off".
+    long_ago = datetime.now(timezone.utc) - timedelta(days=2)
+
+    try:
+        _create_bucket(flask_client, bucket_ids[0], "sessionstate", hostname, metadata)
+        _create_bucket(flask_client, bucket_ids[1], "currentwindow", hostname, metadata)
+        _create_event(
+            flask_client, bucket_ids[0], long_ago, 600, {**metadata, "state": "active"}
+        )
+        _create_event(
+            flask_client,
+            bucket_ids[1],
+            long_ago,
+            600,
+            {**metadata, "app": "Inventor.exe", "title": "part", "state": "active"},
+        )
+
+        list_r = flask_client.get("/api/0/fleet/devices")
+        assert list_r.status_code == 200
+        row = next(
+            (d for d in list_r.json["devices"] if d["device_id"] == device_id), None
+        )
+        assert row is not None, "offline device missing from the device list"
+        assert row["status"] == "offline"
+        assert row["device_name"] == hostname
+        # The row still says whose machine it is, and when it was last heard from.
+        assert username in row["users"]
+        assert row["last_seen"]
+
+        # ...and the detail page it links to actually returns historical data.
+        start = long_ago - timedelta(hours=1)
+        end = long_ago + timedelta(hours=1)
+        detail_r = flask_client.get(
+            f"/api/0/fleet/devices/{device_id}?start={start.isoformat()}&end={end.isoformat()}"
+        )
+        assert detail_r.status_code == 200
+        assert username in detail_r.json["users"]
+        assert detail_r.json["apps"][0]["app"] == "Inventor.exe"
+        assert detail_r.json["totals"]["active_seconds"] >= 599
+    finally:
+        for bucket_id in bucket_ids:
+            _delete_bucket(flask_client, bucket_id)

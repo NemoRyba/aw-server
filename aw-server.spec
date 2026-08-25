@@ -13,16 +13,22 @@ name = "aw-server"
 block_cipher = None
 
 
+datas = [
+    ("aw_server/static", "aw_server/static"),
+    (os.path.join(restx_path, "templates"), "flask_restx/templates"),
+    (os.path.join(restx_path, "static"), "flask_restx/static"),
+    (os.path.join(aw_core_path, "schemas"), "aw_core/schemas"),
+]
+# Watcher auto-update package (staged by rebuild-server-setup.ps1). Optional so
+# the server still builds when no watcher package has been produced yet.
+if os.path.isdir(os.path.join("aw_server", "watcher_package")):
+    datas.append(("aw_server/watcher_package", "aw_server/watcher_package"))
+
 a = Analysis(
     ["__main__.py"],
     pathex=[],
     binaries=None,
-    datas=[
-        ("aw_server/static", "aw_server/static"),
-        (os.path.join(restx_path, "templates"), "flask_restx/templates"),
-        (os.path.join(restx_path, "static"), "flask_restx/static"),
-        (os.path.join(aw_core_path, "schemas"), "aw_core/schemas"),
-    ],
+    datas=datas,
     hiddenimports=[
         "ldap3",
         "ldap3.core.exceptions",

@@ -1,12 +1,17 @@
 import functools
+import hashlib
 import json
 import logging
 import shutil
 import threading
+import time
+import zipfile
 from collections import defaultdict
+from hmac import compare_digest
 from datetime import datetime, timedelta
 from pathlib import Path
 from socket import gethostname
+from urllib.parse import urlparse
 from typing import (
     Any,
     Dict,
@@ -50,6 +55,7 @@ from .fleet import (
 from .fleet_sync import sync_batch, sync_handshake
 from .fleet_sync_store import FleetSyncStore
 from .fleet_summary_store import FleetSummaryStore
+from .fleet_summary_store import _normalize_device_ids_key as normalize_device_ids_key
 from .redmine import (
     RedmineReadOnlyError,
     RedmineReadOnlySource,
@@ -125,6 +131,10 @@ class ServerAPI:
         self.settings = Settings(testing)
         self.sync_store = FleetSyncStore(testing=testing)
         self.summary_store = FleetSummaryStore(testing=testing)
+        # In-memory progress of running chunked user-summary computations,
+        # keyed by (username, range, devices, flag). Read by the progress
+        # endpoint so the UI can show "day X of Y" during long loads.
+        self._user_summary_progress = {}
         self.testing = testing
         self.last_event = {}  # type: dict
         self._summary_precompute_lock = threading.Lock()
@@ -451,6 +461,11 @@ class ServerAPI:
     def set_auth_user_admin(self, username, is_admin):
         return self.settings.set_auth_user_admin(username, is_admin)
 
+    def set_auth_user_access(self, username, allowed_pages=None, landing_page=None):
+        return self.settings.set_auth_user_access(
+            username, allowed_pages=allowed_pages, landing_page=landing_page
+        )
+
     def get_ldap_config(self):
         return self.settings.get_ldap_config()
 
@@ -489,6 +504,598 @@ class ServerAPI:
 
     def set_redmine_config(self, value):
         return self.settings.set_redmine_config(value)
+
+    # Watcher auto-update
+    #
+    # Two package locations exist: the package EMBEDDED into the server build
+    # (read-only, staged by rebuild-server-setup.ps1) and a package UPLOADED at
+    # runtime through the admin GUI (lives in the server data dir, survives
+    # server reinstalls). An uploaded package always wins until it is removed,
+    # so new watcher builds can be distributed without rebuilding the server.
+
+    def _embedded_watcher_package_dir(self) -> Path:
+        return Path(__file__).parent / "watcher_package"
+
+    def _uploaded_watcher_package_dir(self) -> Path:
+        return Path(get_data_dir("aw-server")) / "watcher_package_uploaded"
+
+    def _read_watcher_package_info(self, package_dir: Path, source: str) -> Optional[dict]:
+        try:
+            with open(package_dir / "manifest.json", encoding="utf-8") as f:
+                manifest = json.load(f)
+        except FileNotFoundError:
+            return None
+        except Exception:
+            logger.exception("Could not read watcher package manifest in %s", package_dir)
+            return None
+
+        version = str(manifest.get("version") or "").strip().lower()
+        payload_file = package_dir / "payload.zip"
+        installer_file = package_dir / "install-watchers.ps1"
+        if not version or not payload_file.is_file() or not installer_file.is_file():
+            return None
+        return {
+            "version": version,
+            "sha256": str(manifest.get("sha256") or version).strip().lower(),
+            "created": manifest.get("created"),
+            "payload_bytes": payload_file.stat().st_size,
+            "source": source,
+        }
+
+    def _active_watcher_package(self) -> Optional[dict]:
+        uploaded = self._read_watcher_package_info(
+            self._uploaded_watcher_package_dir(), "uploaded"
+        )
+        if uploaded:
+            return uploaded
+        return self._read_watcher_package_info(
+            self._embedded_watcher_package_dir(), "embedded"
+        )
+
+    def get_watcher_update_manifest(self, hostname: Optional[str] = None) -> dict:
+        config = self.settings.get_watcher_update_config()
+        uploaded = self._read_watcher_package_info(
+            self._uploaded_watcher_package_dir(), "uploaded"
+        )
+        embedded = self._read_watcher_package_info(
+            self._embedded_watcher_package_dir(), "embedded"
+        )
+        active = uploaded or embedded
+        payload = {
+            "available": bool(active),
+            "auto_update_enabled": bool(config.get("auto_update_enabled")),
+            # Detail for the admin GUI; supervisors only read the top-level keys.
+            "uploaded": uploaded,
+            "embedded": embedded,
+        }
+        if active:
+            payload.update(active)
+
+        # A supervisor identifies itself with ?hostname=<COMPUTERNAME> so the
+        # manifest it already polls every minute can also carry an admin's
+        # "update now" request - no extra request, no server->device push.
+        # Where the fleet should talk to the server from now on. Rides the
+        # manifest the supervisor already polls, so moving the server to a new
+        # machine/IP does not need a visit to every device - as long as it is
+        # announced while the OLD server is still reachable.
+        payload["server_endpoint"] = str(
+            self.settings.get_fleet_endpoint_config().get("server_endpoint") or ""
+        )
+
+        payload["update_requested"] = False
+        payload["request_id"] = ""
+        if hostname:
+            request = self.settings.get_watcher_update_request(hostname)
+            if request:
+                payload["update_requested"] = True
+                payload["request_id"] = str(request.get("request_id") or "")
+                payload["requested_version"] = str(
+                    request.get("requested_version") or ""
+                )
+        return payload
+
+    def get_watcher_update_file(self, name: str) -> Optional[Path]:
+        if name not in {"payload.zip", "install-watchers.ps1", "manifest.json"}:
+            return None
+        active = self._active_watcher_package()
+        if not active:
+            return None
+        base = (
+            self._uploaded_watcher_package_dir()
+            if active["source"] == "uploaded"
+            else self._embedded_watcher_package_dir()
+        )
+        path = base / name
+        return path if path.is_file() else None
+
+    def upload_watcher_update_package(self, file_storage) -> dict:
+        """Accepts the wrapper zip from build-setup.ps1 (payload.zip +
+        install-watchers.ps1 [+ manifest.json]) or a bare watcher payload.zip.
+        The version/sha256 are always recomputed server-side."""
+        if file_storage is None:
+            return {"ok": False, "error": "No file uploaded"}
+
+        final_dir = self._uploaded_watcher_package_dir()
+        data_dir = final_dir.parent
+        data_dir.mkdir(parents=True, exist_ok=True)
+        tmp_dir = data_dir / f"watcher_package_uploaded.tmp-{uuid4().hex[:8]}"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            upload_path = tmp_dir / "upload.zip"
+            file_storage.save(str(upload_path))
+
+            payload_path = tmp_dir / "payload.zip"
+            installer_path = tmp_dir / "install-watchers.ps1"
+
+            classification = None
+            try:
+                with zipfile.ZipFile(upload_path) as zf:
+                    entries = [info for info in zf.infolist() if not info.is_dir()]
+                    by_basename: Dict[str, Any] = {}
+                    for info in entries:
+                        base = (
+                            info.filename.replace("\\", "/").rsplit("/", 1)[-1].lower()
+                        )
+                        if base and base not in by_basename:
+                            by_basename[base] = info
+                    if "payload.zip" in by_basename:
+                        classification = "wrapper"
+                        with zf.open(by_basename["payload.zip"]) as src, open(
+                            payload_path, "wb"
+                        ) as dst:
+                            shutil.copyfileobj(src, dst)
+                        if "install-watchers.ps1" in by_basename:
+                            with zf.open(
+                                by_basename["install-watchers.ps1"]
+                            ) as src, open(installer_path, "wb") as dst:
+                                shutil.copyfileobj(src, dst)
+                    elif "supervise-watchers.ps1" in by_basename or any(
+                        info.filename.replace("\\", "/").lstrip("/").startswith(
+                            "aw-watcher-"
+                        )
+                        for info in entries
+                    ):
+                        classification = "payload"
+            except zipfile.BadZipFile:
+                return {"ok": False, "error": "Uploaded file is not a valid zip"}
+
+            if classification is None:
+                return {
+                    "ok": False,
+                    "error": (
+                        "Unrecognized zip: expected the watcher update zip "
+                        "(ActivityWatch-Fleet-Watchers-Update.zip) or a watcher payload.zip"
+                    ),
+                }
+            if classification == "payload":
+                upload_path.replace(payload_path)
+
+            try:
+                with zipfile.ZipFile(payload_path) as pz:
+                    payload_names = pz.namelist()
+                if not any(
+                    name.replace("\\", "/").lstrip("/").startswith("aw-watcher-")
+                    for name in payload_names
+                ):
+                    return {
+                        "ok": False,
+                        "error": "payload.zip contains no aw-watcher-* folders",
+                    }
+            except zipfile.BadZipFile:
+                return {
+                    "ok": False,
+                    "error": "payload.zip inside the upload is not a valid zip",
+                }
+
+            if not installer_path.is_file():
+                fallback = None
+                for candidate_dir in (
+                    self._uploaded_watcher_package_dir(),
+                    self._embedded_watcher_package_dir(),
+                ):
+                    candidate = candidate_dir / "install-watchers.ps1"
+                    if candidate.is_file():
+                        fallback = candidate
+                        break
+                if fallback is None:
+                    return {
+                        "ok": False,
+                        "error": (
+                            "install-watchers.ps1 missing: upload the full "
+                            "ActivityWatch-Fleet-Watchers-Update.zip"
+                        ),
+                    }
+                shutil.copyfile(fallback, installer_path)
+
+            digest = hashlib.sha256()
+            with open(payload_path, "rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            version = digest.hexdigest().lower()
+
+            manifest = {
+                "version": version,
+                "sha256": version,
+                "created": datetime.now().astimezone().isoformat(),
+                "source": "uploaded",
+                "original_filename": str(
+                    getattr(file_storage, "filename", "") or ""
+                )[:200],
+            }
+            with open(tmp_dir / "manifest.json", "w", encoding="utf-8") as f:
+                json.dump(manifest, f, indent=2)
+
+            if upload_path.exists():
+                upload_path.unlink()
+
+            # Swap into place; retry once in case a download briefly holds a
+            # handle on the old package (Windows).
+            for attempt in (1, 2):
+                try:
+                    if final_dir.exists():
+                        shutil.rmtree(final_dir)
+                    tmp_dir.rename(final_dir)
+                    break
+                except OSError:
+                    if attempt == 2:
+                        raise
+                    time.sleep(2)
+
+            logger.info("Watcher update package uploaded: version %s", version)
+            return {"ok": True, "manifest": self.get_watcher_update_manifest()}
+        except Exception as exc:
+            logger.exception("Watcher update package upload failed")
+            return {"ok": False, "error": f"Upload failed: {exc}"}
+        finally:
+            if tmp_dir.exists():
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def delete_uploaded_watcher_package(self) -> dict:
+        final_dir = self._uploaded_watcher_package_dir()
+        if final_dir.exists():
+            try:
+                shutil.rmtree(final_dir)
+            except OSError as exc:
+                logger.exception("Could not remove uploaded watcher package")
+                return {
+                    "ok": False,
+                    "error": f"Could not remove uploaded package: {exc}",
+                }
+        logger.info("Uploaded watcher package removed")
+        return {"ok": True, "manifest": self.get_watcher_update_manifest()}
+
+    def record_watcher_update_status(self, data) -> dict:
+        data = data if isinstance(data, dict) else {}
+        hostname = str(data.get("hostname") or "").strip()
+        if not hostname:
+            return {"ok": False, "error": "hostname required"}
+        version = str(data.get("version") or "").strip().lower()
+        info = {
+            "version": version,
+            "updating": bool(data.get("updating")),
+            "message": str(data.get("message") or "").strip()[:200],
+            "reported_at": datetime.now().astimezone().isoformat(),
+        }
+        self.settings.record_watcher_update_status(hostname, info)
+        self._reconcile_watcher_update_request(hostname, data, version)
+        return {"ok": True}
+
+    def _reconcile_watcher_update_request(self, hostname, data, version) -> None:
+        """Close the loop on a manually requested update.
+
+        Cleared when the device reports the requested version (the install
+        landed), or when it reports being already up to date. Otherwise the
+        request is marked acknowledged so the GUI can show that the device
+        picked it up.
+        """
+        request = self.settings.get_watcher_update_request(hostname)
+        if not request:
+            return
+        requested_version = str(request.get("requested_version") or "").strip().lower()
+        message = str(data.get("message") or "").strip()
+
+        if requested_version and version == requested_version and not data.get("updating"):
+            self.settings.clear_watcher_update_request(hostname)
+            return
+        if message == "up_to_date" and not requested_version:
+            self.settings.clear_watcher_update_request(hostname)
+            return
+
+        reported_request_id = str(data.get("request_id") or "").strip()
+        if reported_request_id or data.get("updating"):
+            self.settings.acknowledge_watcher_update_request(
+                hostname, reported_request_id or request.get("request_id")
+            )
+
+    def get_fleet_auth_config(self) -> dict:
+        config = self.settings.get_fleet_auth_config()
+        # Devices that have proved they can authenticate: used by the GUI to
+        # warn before enforcement is switched on.
+        config["devices_total"], config["devices_reporting"] = (
+            self._watcher_token_readiness()
+        )
+        return config
+
+    def _watcher_token_readiness(self):
+        statuses = self.settings.get_watcher_update_status()
+        reporting = sum(1 for info in statuses.values() if info.get("version"))
+        try:
+            total = len(self.get_fleet_devices().get("devices", []))
+        except Exception:
+            total = reporting
+        return max(total, reporting), reporting
+
+    def set_fleet_auth_config(self, value) -> dict:
+        self.settings.set_fleet_auth_config(value if isinstance(value, dict) else {})
+        return self.get_fleet_auth_config()
+
+    def reveal_fleet_token(self) -> dict:
+        """Full token, for the admin to paste into the watcher installer."""
+        return {"token": self.settings.get_fleet_token()}
+
+    def is_watcher_token_required(self) -> bool:
+        return self.settings.is_watcher_token_required()
+
+    def get_fleet_token(self) -> str:
+        return self.settings.get_fleet_token()
+
+    def is_machine_credential_valid(self, token: str) -> bool:
+        """A machine request is authenticated by either the shared fleet token
+        or the per-device key of an APPROVED enrolled device."""
+        if not token:
+            return False
+        shared = self.settings.get_fleet_token()
+        if shared and compare_digest(token, shared):
+            return True
+        return self.settings.is_device_key_approved(token)
+
+    #
+    # Device enrollment
+    #
+
+    def enroll_device(self, data, address: str) -> dict:
+        data = data if isinstance(data, dict) else {}
+        device_key = str(data.get("device_key") or "").strip()
+        if len(device_key) < 32:
+            return {"ok": False, "error": "device_key missing or too short"}
+
+        entry = self.settings.enroll_device(
+            device_key,
+            hostname=str(data.get("hostname") or "").strip(),
+            address=address,
+            details=data,
+        )
+        if entry is None:
+            return {
+                "ok": False,
+                "error": "Enrollment refused (too many devices are already waiting for approval)",
+            }
+        return {"ok": True, "status": entry.get("status")}
+
+    def get_device_enrollment_status(self, token: str) -> dict:
+        """Lets a device ask 'am I approved yet?' using its own key."""
+        entry = self.settings.get_device_by_key(token) if token else None
+        if not entry:
+            return {"enrolled": False, "status": "unknown"}
+        return {
+            "enrolled": True,
+            "status": entry.get("status"),
+            "hostname": entry.get("hostname"),
+        }
+
+    def list_enrolled_devices(self) -> dict:
+        devices = self.settings.get_fleet_devices()
+        rows = [
+            {
+                "id": key_hash,
+                "hostname": entry.get("hostname"),
+                "address": entry.get("address"),
+                "status": entry.get("status"),
+                "first_seen": entry.get("first_seen"),
+                "last_seen": entry.get("last_seen"),
+                "approved_at": entry.get("approved_at"),
+                "approved_by": entry.get("approved_by"),
+                # Short, non-reversible fingerprint so an admin can tell two
+                # rows with the same hostname apart before approving.
+                "fingerprint": str(key_hash)[:12],
+            }
+            for key_hash, entry in devices.items()
+        ]
+        rows.sort(
+            key=lambda row: (
+                row["status"] != Settings.STATUS_PENDING,
+                str(row.get("hostname") or "").lower(),
+            )
+        )
+        return {
+            "devices": rows,
+            "pending": sum(
+                1 for row in rows if row["status"] == Settings.STATUS_PENDING
+            ),
+            "enforcement_enabled": self.settings.is_watcher_token_required(),
+        }
+
+    def set_device_enrollment(self, device_ids, status: str, actor: str = "") -> dict:
+        updated = [
+            entry
+            for entry in (
+                self.settings.set_device_status(device_id, status, actor)
+                for device_id in (device_ids or [])
+            )
+            if entry
+        ]
+        if not updated:
+            return {"ok": False, "error": "No matching devices"}
+        return {"ok": True, "updated": len(updated)}
+
+    def delete_enrolled_devices(self, device_ids) -> dict:
+        removed = [
+            device_id
+            for device_id in (device_ids or [])
+            if self.settings.delete_device(device_id)
+        ]
+        return {"ok": True, "removed": len(removed)}
+
+    #
+    # Fleet server endpoint
+    #
+
+    def get_fleet_endpoint(self) -> dict:
+        config = self.settings.get_fleet_endpoint_config()
+        config["current_request_host"] = ""
+        return config
+
+    def set_fleet_endpoint(self, data, actor: str = "") -> dict:
+        data = data if isinstance(data, dict) else {}
+        endpoint = str(data.get("server_endpoint") or "").strip().rstrip("/")
+
+        if endpoint:
+            parsed = urlparse(endpoint)
+            if parsed.scheme not in ("http", "https") or not parsed.hostname:
+                return {
+                    "ok": False,
+                    "error": "Enter a full address, e.g. http://192.168.0.200:5600",
+                }
+            # Refuse an address that is not actually serving an aw-server.
+            # Announcing a dead endpoint would send every device somewhere
+            # unreachable, and the only way back is walking the fleet.
+            if not data.get("skip_check"):
+                reachable, detail = self._probe_fleet_endpoint(endpoint)
+                if not reachable:
+                    return {
+                        "ok": False,
+                        "error": f"No ActivityWatch server answered at {endpoint} ({detail}). "
+                        "Start the new server first, or tick 'announce anyway'.",
+                    }
+
+        config = self.settings.set_fleet_endpoint(endpoint, actor)
+        return {"ok": True, "config": config}
+
+    def _probe_fleet_endpoint(self, endpoint: str):
+        try:
+            import urllib.request
+
+            with urllib.request.urlopen(
+                f"{endpoint.rstrip('/')}/api/0/info", timeout=5
+            ) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            if "hostname" in payload and "version" in payload:
+                return True, str(payload.get("hostname"))
+            return False, "unexpected response"
+        except Exception as error:
+            return False, str(error)
+
+    def request_watcher_updates(self, hostnames, requested_by="") -> dict:
+        """Queue an immediate watcher update for the given devices.
+
+        The server cannot push, so this records a pending request that each
+        device's supervisor picks up on its next manifest poll (<=60 s). It
+        deliberately bypasses the auto-update switch and installs even when the
+        reported version already matches, so the button also works as a repair.
+        """
+        manifest = self.get_watcher_update_manifest()
+        if not manifest.get("available"):
+            return {"ok": False, "error": "No watcher package available on the server"}
+
+        ttl = int(
+            self.settings.get_watcher_update_config().get(
+                "manual_update_ttl_minutes", 360
+            )
+        )
+        version = str(manifest.get("version") or "")
+        requested = []
+        for hostname in hostnames or []:
+            entry = self.settings.request_watcher_update(
+                hostname, version, requested_by, ttl
+            )
+            if entry:
+                requested.append(entry)
+        if not requested:
+            return {"ok": False, "error": "No valid devices selected"}
+        logger.info(
+            "Manual watcher update requested by %s for %s device(s), target %s",
+            requested_by or "admin",
+            len(requested),
+            version[:12],
+        )
+        return {"ok": True, "requested": requested, "version": version}
+
+    def cancel_watcher_update_requests(self, hostnames) -> dict:
+        cancelled = [
+            hostname
+            for hostname in hostnames or []
+            if self.settings.clear_watcher_update_request(hostname)
+        ]
+        return {"ok": True, "cancelled": cancelled}
+
+    def get_watcher_update_config(self) -> dict:
+        return self.settings.get_watcher_update_config()
+
+    def set_watcher_update_config(self, value) -> dict:
+        return self.settings.set_watcher_update_config(
+            value if isinstance(value, dict) else {}
+        )
+
+    def get_watcher_update_devices(self) -> dict:
+        manifest = self.get_watcher_update_manifest()
+        server_version = manifest.get("version") if manifest.get("available") else None
+        statuses = self.settings.get_watcher_update_status()
+        requests = self.settings.get_watcher_update_requests()
+
+        def request_for(name):
+            entry = requests.get(self.settings.watcher_request_key(name))
+            if not entry:
+                return {"update_requested": False}
+            return {
+                "update_requested": True,
+                "requested_at": entry.get("requested_at"),
+                "requested_by": entry.get("requested_by"),
+                "request_acknowledged": bool(entry.get("acknowledged_at")),
+                "request_expires_at": entry.get("expires_at"),
+            }
+
+        rows = []
+        seen = set()
+        for hostname, info in statuses.items():
+            version = str(info.get("version") or "")
+            row = {
+                "hostname": hostname,
+                "version": version,
+                "reported_at": info.get("reported_at"),
+                "updating": bool(info.get("updating")),
+                "message": info.get("message") or "",
+                "up_to_date": bool(server_version) and version == server_version,
+            }
+            row.update(request_for(hostname))
+            rows.append(row)
+            seen.add(hostname.strip().lower())
+
+        # Fleet devices that never reported a watcher version run a supervisor
+        # from before the auto-update feature: they need one manual update.
+        try:
+            for device in self.get_fleet_devices().get("devices", []):
+                name = str(
+                    device.get("device_name") or device.get("device_id") or ""
+                ).strip()
+                if not name or name.lower() in seen:
+                    continue
+                seen.add(name.lower())
+                row = {
+                    "hostname": name,
+                    "version": "",
+                    "reported_at": None,
+                    "updating": False,
+                    "message": "never_reported",
+                    "up_to_date": False,
+                }
+                row.update(request_for(name))
+                rows.append(row)
+        except Exception:
+            logger.exception("Could not merge fleet devices into watcher update list")
+
+        rows.sort(key=lambda row: str(row["hostname"]).lower())
+        return {"manifest": manifest, "devices": rows}
 
     def get_redmine_user_mappings(self):
         config = self.settings.get_redmine_config(include_secret=True)
@@ -739,7 +1346,9 @@ class ServerAPI:
         }
         return payload
 
-    def get_fleet_redmine_daily_comparison(self, start=None, end=None, usernames=None):
+    def get_fleet_redmine_daily_comparison(
+        self, start=None, end=None, usernames=None, force=False
+    ):
         """Per fleet-day comparison: active session time (from the day-chunk
         cache) vs the Redmine bookings of that day, entry by entry (project,
         hours, comment) for every selected, mapped user."""
@@ -847,6 +1456,7 @@ class ServerAPI:
                         start=chunk_start,
                         end=chunk_end,
                         exclude_inactive_session_afk=True,
+                        force=force,
                     )
                     active_seconds = float(
                         (summary.get("totals") or {}).get("active_seconds") or 0.0
@@ -1161,6 +1771,41 @@ class ServerAPI:
         )
 
     @staticmethod
+    def _user_summary_progress_key(
+        username, range_start, range_end, device_ids, exclude_inactive_session_afk
+    ):
+        return "|".join(
+            [
+                str(username),
+                str(range_start),
+                str(range_end),
+                normalize_device_ids_key(device_ids),
+                "1" if exclude_inactive_session_afk else "0",
+            ]
+        )
+
+    def get_fleet_user_summary_progress(
+        self,
+        username,
+        start=None,
+        end=None,
+        device_ids=None,
+        exclude_inactive_session_afk=True,
+    ):
+        start, end = normalize_fleet_range(start, end)
+        key = self._user_summary_progress_key(
+            username,
+            format_fleet_datetime(start),
+            format_fleet_datetime(end),
+            device_ids,
+            exclude_inactive_session_afk,
+        )
+        record = self._user_summary_progress.get(key)
+        if not record:
+            return {"active": False}
+        return {"active": not record.get("finished", False), **record}
+
+    @staticmethod
     def _fleet_day_row_valid(row, chunk_end) -> bool:
         """A cached day row is trustworthy only if it was calculated AFTER the
         day ended; otherwise it is a partial snapshot and must be recomputed."""
@@ -1201,9 +1846,45 @@ class ServerAPI:
         chunks = iter_fleet_day_ranges(start, end, config["start_of_day"])
         now = datetime.now().astimezone()
 
+        progress_key = self._user_summary_progress_key(
+            username,
+            format_fleet_datetime(start),
+            format_fleet_datetime(end),
+            device_ids,
+            exclude_inactive_session_afk,
+        )
+        # Sweep finished entries so the registry stays small.
+        if len(self._user_summary_progress) > 100:
+            cutoff = datetime.now().astimezone() - timedelta(hours=1)
+
+            def _keep_progress(value):
+                if value.get("finished"):
+                    return False
+                try:
+                    started = datetime.fromisoformat(str(value.get("started_at")))
+                except (TypeError, ValueError):
+                    return False
+                return started >= cutoff
+
+            self._user_summary_progress = {
+                key: value
+                for key, value in self._user_summary_progress.items()
+                if _keep_progress(value)
+            }
+        progress = {
+            "total_days": len(chunks),
+            "days_done": 0,
+            "days_computed": 0,
+            "current_day": None,
+            "started_at": datetime.now().astimezone().isoformat(),
+            "finished": False,
+        }
+        self._user_summary_progress[progress_key] = progress
+
         chunk_summaries = []
         all_cached = bool(chunks) and not force
         for chunk_start, chunk_end in chunks:
+            progress["current_day"] = chunk_start.astimezone().date().isoformat()
             chunk_range_start = format_fleet_datetime(chunk_start)
             chunk_range_end = format_fleet_datetime(chunk_end)
             complete = chunk_end <= now
@@ -1250,8 +1931,11 @@ class ServerAPI:
                     )
                 else:
                     row = day
+                progress["days_computed"] += 1
             chunk_summaries.append(row)
+            progress["days_done"] += 1
 
+        progress["finished"] = True
         merged = merge_user_summary_chunks(
             username,
             start,

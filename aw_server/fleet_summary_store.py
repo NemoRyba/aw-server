@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -7,6 +8,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from aw_core.dirs import get_data_dir
+
+logger = logging.getLogger(__name__)
 
 
 def _utcnow() -> str:
@@ -98,7 +101,17 @@ class FleetSummaryStore:
         self._lock = threading.Lock()
 
         if testing and self.path.exists():
-            os.remove(self.path)
+            # Start each testing run from a clean database, but never let a
+            # locked file kill startup: on Windows the file can still be held
+            # (another testing server, an antivirus scan, a stale handle), and
+            # a throw here propagates out of ServerAPI.__init__ and aborts the
+            # whole server.
+            try:
+                os.remove(self.path)
+            except OSError as error:
+                logger.warning(
+                    "Could not reset the testing database %s: %s", self.path, error
+                )
 
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row

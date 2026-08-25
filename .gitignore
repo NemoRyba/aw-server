@@ -14,3 +14,14 @@ venv
 htmlcov
 coverage.xml
 coverage_html
+
+# Watcher package staged into the server build by rebuild-server-setup.ps1.
+# Regenerated on every build (~46 MB) and must never be committed.
+# NOTE: the ROOT .gitignore lists this path too, but a parent repo's ignores do
+# not apply inside a submodule - it has to be here.
+aw_server/watcher_package/
+
+# Data dir the server creates when it is run with this folder as the working
+# directory (aw-server.exe, tests, smoke runs). Contains settings.json with the
+# session secret, the fleet token and password hashes.
+activitywatch/

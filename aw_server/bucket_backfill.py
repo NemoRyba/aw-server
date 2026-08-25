@@ -1,6 +1,8 @@
 import logging
 from typing import Any, Dict, Optional
 
+from aw_core.identity import normalize_session_type
+
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +68,12 @@ def _merged_identity_data(bucket: Dict[str, Any], event: Optional[Dict[str, Any]
         device_name = merged.get("hostname") or merged.get("device_id")
         if not _is_missing_value("device_name", device_name):
             merged["device_name"] = device_name
+
+    # Rewrite the stored session_type into the canonical vocabulary. This runs
+    # once at server start and is idempotent; it is the only place that should
+    # ever mutate stored identity metadata.
+    if "session_type" in merged:
+        merged["session_type"] = normalize_session_type(merged.get("session_type"))
 
     return merged
 

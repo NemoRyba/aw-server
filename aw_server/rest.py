@@ -14,6 +14,7 @@ from flask import (
     jsonify,
     make_response,
     request,
+    send_file,
     session,
 )
 from flask_restx import Api, Resource, fields
@@ -22,7 +23,7 @@ from datetime import datetime, timedelta
 from . import logger
 from .fleet import get_bucket_identity
 from .api import ServerAPI
-from .exceptions import BadRequest, Unauthorized
+from .exceptions import BadRequest, NotFound, Unauthorized
 from .fleet_sync import FleetSyncConflict
 
 
@@ -156,6 +157,10 @@ def _auth_payload():
             "username": username,
             "is_admin": bool(user.get("is_admin", False)),
             "source": str(user.get("source") or "local"),
+            "allowed_pages": [
+                str(page) for page in (user.get("allowed_pages") or []) if page
+            ],
+            "landing_page": str(user.get("landing_page") or ""),
         },
     }
 
@@ -258,6 +263,48 @@ def _manual_event_window(event_dicts, extra_events=None):
     if not stamps:
         return None, None
     return min(s for s, _e in stamps), max(e for _s, e in stamps)
+
+
+TRASH_BUCKET_PREFIX = "trash__"
+
+
+def _trash_bucket_id(bucket_id):
+    return f"{TRASH_BUCKET_PREFIX}{bucket_id}"
+
+
+def _move_event_to_trash(bucket_id, event_dict, editor_username):
+    """Copy a deleted event into the bucket's trash bucket so it can be
+    restored. The trash bucket's type is prefixed with 'trashed.' so fleet
+    summaries never count it as watcher data."""
+    bucket = (current_app.api.get_buckets() or {}).get(bucket_id) or {}
+    trash_bucket_id = _trash_bucket_id(bucket_id)
+    bucket_data = dict(bucket.get("data") or {})
+    bucket_data["original_bucket_id"] = bucket_id
+    current_app.api.create_bucket(
+        trash_bucket_id,
+        event_type=f"trashed.{bucket.get('type') or 'unknown'}",
+        client="aw-trash",
+        hostname=str(bucket.get("hostname") or "unknown"),
+        data=bucket_data,
+    )
+
+    data = dict(event_dict.get("data") or {})
+    data["$deleted"] = {
+        "by": editor_username,
+        "at": datetime.now().astimezone().isoformat(),
+        "from": bucket_id,
+        "original_event_id": event_dict.get("id"),
+    }
+    current_app.api.create_events(
+        trash_bucket_id,
+        [
+            Event(
+                timestamp=event_dict.get("timestamp"),
+                duration=float(event_dict.get("duration") or 0.0),
+                data=data,
+            )
+        ],
+    )
 
 
 def _require_admin_user():
@@ -495,6 +542,19 @@ class EventResource(Resource):
                 previous = current_app.api.get_event(bucket_id, event_id)
             except Exception:
                 previous = None
+            if previous and not str(bucket_id).startswith(TRASH_BUCKET_PREFIX):
+                # Safety: the trash copy must exist BEFORE the original is
+                # removed; if it cannot be written, refuse the deletion.
+                try:
+                    _move_event_to_trash(bucket_id, previous, editor_username)
+                except Exception as error:
+                    logger.exception(
+                        "Unable to move event %s to trash before deletion", event_id
+                    )
+                    return {
+                        "success": False,
+                        "message": f"Event was NOT deleted: trash copy failed ({error})",
+                    }, 500
 
         success = current_app.api.delete_event(bucket_id, event_id)
 
@@ -507,6 +567,65 @@ class EventResource(Resource):
                     username=_bucket_event_username(bucket_id),
                 )
         return {"success": success}, 200
+
+
+@api.route("/0/buckets/<string:bucket_id>/events/<int:event_id>/restore")
+class EventRestoreResource(Resource):
+    def post(self, bucket_id: str, event_id: int):
+        """Restore an event from a trash bucket back into its original bucket."""
+        editor_username = _manual_event_editor_user()
+        if not editor_username:
+            raise Unauthorized("AuthRequired", "Authentication required to restore events")
+
+        event = current_app.api.get_event(bucket_id, event_id)
+        if not event:
+            return None, 404
+
+        data = dict(event.get("data") or {})
+        deleted_meta = data.get("$deleted") or {}
+        bucket = (current_app.api.get_buckets() or {}).get(bucket_id) or {}
+        original_bucket_id = deleted_meta.get("from") or (
+            dict(bucket.get("data") or {}).get("original_bucket_id")
+        )
+        if not original_bucket_id:
+            raise BadRequest("NotATrashEvent", "This event is not in a trash bucket")
+
+        _authorize_manual_event_operation(original_bucket_id, editor_username)
+
+        data.pop("$deleted", None)
+        history = data.get("$edits")
+        if not isinstance(history, list):
+            history = []
+        history.append(
+            {
+                "by": editor_username,
+                "at": datetime.now().astimezone().isoformat(),
+                "action": "restored",
+            }
+        )
+        data["$edits"] = history
+
+        restored = current_app.api.create_events(
+            original_bucket_id,
+            [
+                Event(
+                    timestamp=event.get("timestamp"),
+                    duration=float(event.get("duration") or 0.0),
+                    data=data,
+                )
+            ],
+        )
+        current_app.api.delete_event(bucket_id, event_id)
+
+        window_start, window_end = _manual_event_window([event])
+        if window_start is not None:
+            current_app.api.invalidate_fleet_user_summaries(
+                window_start,
+                window_end,
+                username=_bucket_event_username(original_bucket_id),
+            )
+
+        return (restored.to_json_dict() if restored else None), 200
 
 
 @api.route("/0/buckets/<string:bucket_id>/heartbeat")
@@ -697,12 +816,28 @@ class AdminAuthUserResource(Resource):
     def post(self, username):
         _require_builtin_admin_user()
         data = request.get_json() or {}
-        user = current_app.api.set_auth_user_admin(
-            username,
-            bool(data.get("is_admin", False)),
-        )
-        if not user:
-            raise BadRequest("UnknownAuthUser", "Authentication user not found")
+        user = None
+        if "is_admin" in data:
+            user = current_app.api.set_auth_user_admin(
+                username,
+                bool(data.get("is_admin", False)),
+            )
+            if not user:
+                raise BadRequest("UnknownAuthUser", "Authentication user not found")
+        if "allowed_pages" in data or "landing_page" in data:
+            user = current_app.api.set_auth_user_access(
+                username,
+                allowed_pages=(
+                    data.get("allowed_pages") if "allowed_pages" in data else None
+                ),
+                landing_page=(
+                    data.get("landing_page") if "landing_page" in data else None
+                ),
+            )
+            if not user:
+                raise BadRequest("UnknownAuthUser", "Authentication user not found")
+        if user is None:
+            raise BadRequest("InvalidAuthUserUpdate", "No supported fields in payload")
         return jsonify(user)
 
 
@@ -742,6 +877,55 @@ class AdminRedmineMappingsResource(Resource):
 
 
 # FLEET
+
+
+def _authorize_fleet_page(page: str, target_username: str = None):
+    """Session-scoped fleet page authorization.
+
+    Admin sessions pass everything. A logged-in non-admin passes only for
+    pages granted to them (settings: allowed_pages) - except their OWN user
+    detail, which is always allowed.
+
+    Sessionless requests never reach here in production: server._enforce_api_auth
+    already rejects every /api/0/fleet/* read without a login. The early return
+    below only covers testing mode, where that gate is disabled.
+    """
+    username, user = _current_auth_user()
+    if not username or not user:
+        return
+    if bool(user.get("is_admin", False)):
+        return
+    if target_username is not None and str(target_username).lower() == str(username).lower():
+        return
+    allowed = {str(page_key) for page_key in (user.get("allowed_pages") or [])}
+    if page in allowed:
+        return
+    raise Unauthorized("PageNotAllowed", "This page is not enabled for your user")
+
+
+def _authorize_fleet_summary_scope():
+    """Authorize the Zusammenfassung page and return the username it must be
+    restricted to, or None when the caller may see everyone.
+
+    Two grants lead here: "fleet-summary" (the whole fleet) and
+    "fleet-summary-own" (the same page, own row only). The restriction is
+    applied by OVERWRITING the requested usernames rather than rejecting the
+    request, so there is no way to phrase a request that leaks another user -
+    the client cannot opt out of its own scope.
+    """
+    username, user = _current_auth_user()
+    if not username or not user:
+        # Testing mode only; production is gated by server._enforce_api_auth.
+        return None
+    if bool(user.get("is_admin", False)):
+        return None
+
+    allowed = {str(page) for page in (user.get("allowed_pages") or [])}
+    if "fleet-summary" in allowed:
+        return None
+    if "fleet-summary-own" in allowed:
+        return username
+    raise Unauthorized("PageNotAllowed", "This page is not enabled for your user")
 
 
 def _fleet_range():
@@ -860,30 +1044,37 @@ def _parse_query_date(value: str):
 @api.route("/0/fleet/live")
 class FleetLiveResource(Resource):
     def get(self):
+        _authorize_fleet_page("fleet-live")
         return jsonify(current_app.api.get_live_fleet_summary())
 
 
 @api.route("/0/fleet/storage")
 class FleetStorageResource(Resource):
     def get(self):
+        _authorize_fleet_page("fleet-live")
         return jsonify(current_app.api.get_fleet_storage())
 
 
 @api.route("/0/fleet/users")
 class FleetUsersResource(Resource):
     def get(self):
+        _authorize_fleet_page("fleet-users")
         return jsonify(current_app.api.get_fleet_users())
 
 
 @api.route("/0/fleet/summary")
 class FleetSummaryResource(Resource):
     def get(self):
+        scope = _authorize_fleet_summary_scope()
         start, end = _fleet_range()
+        usernames = _fleet_usernames_arg()
+        if scope is not None:
+            usernames = [scope]
         return jsonify(
             current_app.api.get_fleet_summary(
                 start=start,
                 end=end,
-                usernames=_fleet_usernames_arg(),
+                usernames=usernames,
                 exclude_inactive_session_afk=_fleet_bool_arg(
                     "exclude_inactive_session_afk", True
                 ),
@@ -893,10 +1084,14 @@ class FleetSummaryResource(Resource):
 
 @api.route("/0/fleet/summary/precompute/config")
 class FleetSummaryPrecomputeConfigResource(Resource):
+    # Server-wide nightly precompute settings; only reachable from the
+    # admin-only Einstellungen page.
     def get(self):
+        _require_admin_user()
         return jsonify(current_app.api.get_fleet_summary_precompute_config())
 
     def post(self):
+        _require_admin_user()
         return jsonify(
             current_app.api.set_fleet_summary_precompute_config(
                 request.get_json() or {}
@@ -907,12 +1102,18 @@ class FleetSummaryPrecomputeConfigResource(Resource):
 @api.route("/0/fleet/summary/precompute")
 class FleetSummaryPrecomputeResource(Resource):
     def post(self):
+        # Recomputing is expensive, so it is scoped exactly like reading:
+        # a user restricted to their own summary can only recompute their own.
+        scope = _authorize_fleet_summary_scope()
         data = request.get_json() or {}
+        usernames = data.get("usernames")
+        if scope is not None:
+            usernames = [scope]
         return jsonify(
             current_app.api.precompute_fleet_user_summaries(
                 start=_fleet_json_date(data, "start"),
                 end=_fleet_json_date(data, "end"),
-                usernames=data.get("usernames"),
+                usernames=usernames,
                 force=_fleet_json_bool(data, "force", True),
                 source="manual",
                 start_of_day=data.get("start_of_day") or data.get("startOfDay"),
@@ -923,12 +1124,16 @@ class FleetSummaryPrecomputeResource(Resource):
 @api.route("/0/fleet/redmine-comparison")
 class FleetRedmineComparisonResource(Resource):
     def post(self):
+        scope = _authorize_fleet_summary_scope()
         data = request.get_json() or {}
+        usernames = data.get("usernames") or []
+        if scope is not None:
+            usernames = [scope]
         return jsonify(
             current_app.api.get_fleet_redmine_comparison(
                 start=_fleet_json_date(data, "start"),
                 end=_fleet_json_date(data, "end"),
-                usernames=data.get("usernames") or [],
+                usernames=usernames,
             )
         )
 
@@ -936,12 +1141,17 @@ class FleetRedmineComparisonResource(Resource):
 @api.route("/0/fleet/redmine-daily-comparison")
 class FleetRedmineDailyComparisonResource(Resource):
     def post(self):
+        scope = _authorize_fleet_summary_scope()
         data = request.get_json() or {}
+        usernames = data.get("usernames") or []
+        if scope is not None:
+            usernames = [scope]
         return jsonify(
             current_app.api.get_fleet_redmine_daily_comparison(
                 start=_fleet_json_date(data, "start"),
                 end=_fleet_json_date(data, "end"),
-                usernames=data.get("usernames") or [],
+                usernames=usernames,
+                force=bool(data.get("force")),
             )
         )
 
@@ -949,6 +1159,7 @@ class FleetRedmineDailyComparisonResource(Resource):
 @api.route("/0/fleet/users/<string:username>")
 class FleetUserResource(Resource):
     def get(self, username: str):
+        _authorize_fleet_page("fleet-users", target_username=username)
         start, end = _fleet_range()
         return jsonify(
             current_app.api.get_fleet_user(
@@ -963,9 +1174,28 @@ class FleetUserResource(Resource):
         )
 
 
+@api.route("/0/fleet/users/<string:username>/summary/progress")
+class FleetUserSummaryProgressResource(Resource):
+    def get(self, username: str):
+        _authorize_fleet_page("fleet-users", target_username=username)
+        start, end = _fleet_range()
+        return jsonify(
+            current_app.api.get_fleet_user_summary_progress(
+                username,
+                start=start,
+                end=end,
+                device_ids=_fleet_device_ids(),
+                exclude_inactive_session_afk=_fleet_bool_arg(
+                    "exclude_inactive_session_afk"
+                ),
+            )
+        )
+
+
 @api.route("/0/fleet/users/<string:username>/activity-summary")
 class FleetUserActivitySummaryResource(Resource):
     def get(self, username: str):
+        _authorize_fleet_page("fleet-users", target_username=username)
         start, end = _fleet_range()
         return jsonify(
             current_app.api.get_fleet_user_activity(
@@ -985,6 +1215,7 @@ class FleetUserActivitySummaryResource(Resource):
 @api.route("/0/fleet/users/<string:username>/summary/recalculate")
 class FleetUserSummaryRecalculateResource(Resource):
     def post(self, username: str):
+        _authorize_fleet_page("fleet-users", target_username=username)
         data = request.get_json() or {}
         return jsonify(
             current_app.api.recalculate_fleet_user_summary(
@@ -1002,6 +1233,7 @@ class FleetUserSummaryRecalculateResource(Resource):
 @api.route("/0/fleet/devices")
 class FleetDevicesResource(Resource):
     def get(self):
+        _authorize_fleet_page("fleet-devices")
         return jsonify(current_app.api.get_fleet_devices())
 
 
@@ -1022,6 +1254,7 @@ class FleetDeviceMetricsResource(Resource):
 @api.route("/0/fleet/devices/<string:device_id>")
 class FleetDeviceResource(Resource):
     def get(self, device_id: str):
+        _authorize_fleet_page("fleet-devices")
         start, end = _fleet_range()
         return jsonify(
             current_app.api.get_fleet_device(
@@ -1033,6 +1266,272 @@ class FleetDeviceResource(Resource):
                 ),
             )
         )
+
+
+@api.route("/0/fleet/watcher-update/manifest")
+class FleetWatcherUpdateManifestResource(Resource):
+    # Machine endpoint: polled once a minute by the SYSTEM watcher supervisor
+    # on every fleet device. Authenticated with the fleet token rather than a
+    # browser session (see server._is_machine_api_request).
+    def get(self):
+        # The supervisor identifies itself so the manifest can carry a manual
+        # "update now" request for exactly this device.
+        hostname = request.args.get("hostname", "").strip()
+        return jsonify(current_app.api.get_watcher_update_manifest(hostname or None))
+
+
+@api.route("/0/fleet/watcher-update/payload")
+class FleetWatcherUpdatePayloadResource(Resource):
+    def get(self):
+        path = current_app.api.get_watcher_update_file("payload.zip")
+        if not path:
+            raise NotFound(
+                "NoWatcherPackage",
+                "No watcher package is embedded in this server build",
+            )
+        return send_file(
+            str(path),
+            mimetype="application/zip",
+            as_attachment=True,
+            conditional=True,
+        )
+
+
+@api.route("/0/fleet/watcher-update/installer")
+class FleetWatcherUpdateInstallerResource(Resource):
+    def get(self):
+        path = current_app.api.get_watcher_update_file("install-watchers.ps1")
+        if not path:
+            raise NotFound(
+                "NoWatcherPackage",
+                "No watcher installer is embedded in this server build",
+            )
+        return send_file(
+            str(path),
+            mimetype="text/plain",
+            as_attachment=True,
+            conditional=True,
+        )
+
+
+@api.route("/0/fleet/watcher-update/status")
+class FleetWatcherUpdateStatusResource(Resource):
+    def post(self):
+        data = request.get_json(force=True, silent=True) or {}
+        return jsonify(current_app.api.record_watcher_update_status(data))
+
+
+@api.route("/0/fleet/watcher-update/devices")
+class FleetWatcherUpdateDevicesResource(Resource):
+    def get(self):
+        _require_admin_user()
+        return jsonify(current_app.api.get_watcher_update_devices())
+
+
+@api.route("/0/fleet/watcher-update/config")
+class FleetWatcherUpdateConfigResource(Resource):
+    def get(self):
+        _require_admin_user()
+        return jsonify(current_app.api.get_watcher_update_config())
+
+    def post(self):
+        _require_admin_user()
+        return jsonify(
+            current_app.api.set_watcher_update_config(request.get_json() or {})
+        )
+
+
+@api.route("/0/fleet/watcher-update/upload")
+class FleetWatcherUpdateUploadResource(Resource):
+    def post(self):
+        # Admin uploads a new watcher package (multipart form, field "file"):
+        # distributed to the fleet immediately, no server rebuild required.
+        _require_admin_user()
+        file_storage = None
+        if request.files:
+            file_storage = request.files.get("file")
+            if file_storage is None:
+                file_storage = next(iter(request.files.values()))
+        result = current_app.api.upload_watcher_update_package(file_storage)
+        if not result.get("ok"):
+            raise BadRequest(
+                "WatcherUpdateUploadFailed", result.get("error") or "Upload failed"
+            )
+        return jsonify(result)
+
+    def delete(self):
+        # Removes the uploaded override; the package embedded in the server
+        # build (if any) becomes active again.
+        _require_admin_user()
+        result = current_app.api.delete_uploaded_watcher_package()
+        if not result.get("ok"):
+            raise BadRequest(
+                "WatcherUpdateDeleteFailed", result.get("error") or "Delete failed"
+            )
+        return jsonify(result)
+
+
+def _watcher_update_hostnames(data):
+    values = data.get("hostnames")
+    if values is None:
+        values = data.get("hostname")
+    if values is None:
+        return []
+    values = values if isinstance(values, list) else [values]
+    hostnames = []
+    seen = set()
+    for value in values:
+        hostname = str(value or "").strip()
+        key = hostname.lower()
+        if not hostname or key in seen:
+            continue
+        seen.add(key)
+        hostnames.append(hostname)
+    return hostnames
+
+
+@api.route("/0/fleet/watcher-update/request")
+class FleetWatcherUpdateRequestResource(Resource):
+    def post(self):
+        """Admin: 'update now' for one, several or all selected devices.
+
+        Queues a pending request per device; their supervisors pick it up on
+        the next manifest poll, bypassing the auto-update switch.
+        """
+        user = _require_admin_user()
+        data = request.get_json() or {}
+        result = current_app.api.request_watcher_updates(
+            _watcher_update_hostnames(data), requested_by=user["username"]
+        )
+        if not result.get("ok"):
+            raise BadRequest(
+                "WatcherUpdateRequestFailed", result.get("error") or "Request failed"
+            )
+        return jsonify(result)
+
+    def delete(self):
+        _require_admin_user()
+        data = request.get_json(silent=True) or {}
+        return jsonify(
+            current_app.api.cancel_watcher_update_requests(
+                _watcher_update_hostnames(data)
+            )
+        )
+
+
+@api.route("/0/admin/fleet-auth")
+class AdminFleetAuthResource(Resource):
+    def get(self):
+        _require_builtin_admin_user()
+        return jsonify(current_app.api.get_fleet_auth_config())
+
+    def post(self):
+        _require_builtin_admin_user()
+        return jsonify(current_app.api.set_fleet_auth_config(request.get_json() or {}))
+
+
+@api.route("/0/admin/fleet-auth/token")
+class AdminFleetAuthTokenResource(Resource):
+    def get(self):
+        # The full token is only ever handed to the built-in admin, who needs
+        # it to run the watcher installer on a device.
+        _require_builtin_admin_user()
+        return jsonify(current_app.api.reveal_fleet_token())
+
+
+# DEVICE ENROLLMENT
+
+
+def _client_address():
+    # X-Forwarded-For is attacker-controlled; only trust it if the deployment
+    # actually sits behind a proxy, which this one does not.
+    return str(request.remote_addr or "")
+
+
+def _bearer_token():
+    # Same extraction as server._bearer_token; duplicated rather than imported
+    # because server.py imports this module, not the other way round.
+    header = request.headers.get("Authorization", "")
+    if header.lower().startswith("bearer "):
+        return header[7:].strip()
+    return request.headers.get("X-AW-Fleet-Token", "").strip()
+
+
+@api.route("/0/fleet/enroll")
+class FleetEnrollResource(Resource):
+    def post(self):
+        """A device asks to join the fleet.
+
+        Unauthenticated on purpose - this is how a device with no credential
+        gets one. It grants nothing: the device is recorded as pending and
+        cannot write data until an admin approves it in the GUI.
+        """
+        data = request.get_json(force=True, silent=True) or {}
+        result = current_app.api.enroll_device(data, _client_address())
+        if not result.get("ok"):
+            raise BadRequest("EnrollmentFailed", result.get("error") or "Enrollment failed")
+        return jsonify(result)
+
+
+@api.route("/0/fleet/enroll/status")
+class FleetEnrollStatusResource(Resource):
+    def get(self):
+        """'Am I approved yet?', asked by the device with its own key."""
+        return jsonify(current_app.api.get_device_enrollment_status(_bearer_token()))
+
+
+@api.route("/0/fleet/devices/enrollment")
+class FleetDeviceEnrollmentResource(Resource):
+    def get(self):
+        _require_admin_user()
+        return jsonify(current_app.api.list_enrolled_devices())
+
+    def post(self):
+        user = _require_admin_user()
+        data = request.get_json() or {}
+        status = str(data.get("status") or "").strip()
+        result = current_app.api.set_device_enrollment(
+            _device_ids(data), status, actor=user["username"]
+        )
+        if not result.get("ok"):
+            raise BadRequest("EnrollmentUpdateFailed", result.get("error") or "Failed")
+        return jsonify(result)
+
+    def delete(self):
+        _require_admin_user()
+        data = request.get_json(silent=True) or {}
+        return jsonify(current_app.api.delete_enrolled_devices(_device_ids(data)))
+
+
+def _device_ids(data):
+    values = data.get("device_ids")
+    if values is None:
+        values = data.get("id")
+    if values is None:
+        return []
+    values = values if isinstance(values, list) else [values]
+    return [str(value).strip() for value in values if str(value).strip()]
+
+
+@api.route("/0/admin/fleet-endpoint")
+class AdminFleetEndpointResource(Resource):
+    def get(self):
+        _require_builtin_admin_user()
+        return jsonify(current_app.api.get_fleet_endpoint())
+
+    def post(self):
+        """Announce the address the fleet should use from now on.
+
+        Only meaningful while the CURRENT server is still reachable by the
+        devices - they learn the new address from the manifest they poll here.
+        """
+        user = _require_builtin_admin_user()
+        result = current_app.api.set_fleet_endpoint(
+            request.get_json() or {}, actor=user["username"]
+        )
+        if not result.get("ok"):
+            raise BadRequest("FleetEndpointRejected", result.get("error") or "Rejected")
+        return jsonify(result)
 
 
 @api.route("/0/fleet/report")
