@@ -1641,6 +1641,50 @@ def test_full_summary_grant_is_not_restricted(flask_client):
             _delete_bucket(flask_client, bucket_id)
 
 
+def test_daily_comparison_returns_days_without_redmine(flask_client):
+    """The personal summary page is built around the per-day list, so the days
+    must survive Redmine being switched off - only the bookings go missing."""
+    suffix = str(random.randint(0, 10**6))
+    username = f"noredmine-{suffix}"
+    bucket_id = None
+    try:
+        bucket_id = _seed_summary_user(
+            flask_client, username, f"pc-e-{suffix}", f"host-e-{suffix}"
+        )
+        now = datetime.now(timezone.utc)
+        r = flask_client.post(
+            "/api/0/fleet/redmine-daily-comparison",
+            json={
+                "start": (now - timedelta(hours=6)).isoformat(),
+                "end": (now + timedelta(hours=1)).isoformat(),
+                "usernames": [username],
+            },
+        )
+        assert r.status_code == 200
+        payload = r.json
+        # Redmine is off in the testing profile: the reason is reported...
+        assert payload["enabled"] is False
+        assert payload["message"]
+        # ...but the tracked time is still there, day by day.
+        rows = [
+            row
+            for day in payload["days"]
+            for row in day["users"]
+            if row["username"] == username
+        ]
+        assert rows, "a day with tracked time must be returned without Redmine"
+        assert sum(row["active_seconds"] for row in rows) > 0
+        # Unbooked must read as "unknown", not as "booked nothing".
+        for row in rows:
+            assert row["redmine_seconds"] is None
+            assert row["delta_seconds"] is None
+            assert row["matched"] is False
+            assert row["entries"] == []
+    finally:
+        if bucket_id:
+            _delete_bucket(flask_client, bucket_id)
+
+
 def test_summary_needs_one_of_the_two_grants(flask_client):
     suffix = str(random.randint(0, 10**6))
     me = f"nosum-{suffix}"

@@ -138,23 +138,8 @@ class RedmineReadOnlySource:
         self.driver = str(self.config.get("driver") or "auto").strip().lower()
 
     def active_users(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
-        users_table = self._table("users")
         limit_sql = f" LIMIT {max(1, int(limit))}" if limit else ""
-        rows = self._query(
-            f"""
-            SELECT
-                id,
-                login,
-                firstname,
-                lastname,
-                mail
-            FROM {users_table}
-            WHERE status = 1
-                AND login <> ''
-            ORDER BY login
-            {limit_sql}
-            """
-        )
+        rows = self._query_active_users(limit_sql)
         return [
             {
                 "id": _coerce_int(row.get("id")),
@@ -165,6 +150,77 @@ class RedmineReadOnlySource:
             }
             for row in rows
         ]
+
+    def _active_users_sql(
+        self, limit_sql: str, *, email_table: bool, mail_column: bool
+    ) -> str:
+        """Build the active-user query for one of the Redmine schema variants.
+
+        Redmine 3.0 moved the authoritative address out of `users.mail` and
+        into `email_addresses` (one row per address, `is_default` marking the
+        primary one). Upgraded databases frequently KEEP the now-unmaintained
+        `users.mail` column, so accounts created after the upgrade show their
+        address in the Redmine UI while `users.mail` stays empty - and an
+        empty address is exactly what makes a user silently fail to auto-map.
+        Read `email_addresses` first and treat `users.mail` as a fallback for
+        databases that predate the split.
+        """
+        users_table = self._table("users")
+        if email_table:
+            email_table_name = self._table("email_addresses")
+            # A correlated subquery rather than a join: a user may have several
+            # addresses, and a join would duplicate the user row. Prefer the
+            # default address, but fall back to any address the user has, so a
+            # record with no default flag still resolves.
+            address_sql = f"""(
+                    SELECT ea.address
+                    FROM {email_table_name} ea
+                    WHERE ea.user_id = u.id
+                    ORDER BY ea.is_default DESC, ea.id ASC
+                    LIMIT 1
+                )"""
+        if email_table and mail_column:
+            mail_sql = f"COALESCE(NULLIF(TRIM({address_sql}), ''), u.mail)"
+        elif email_table:
+            mail_sql = address_sql
+        else:
+            mail_sql = "u.mail"
+
+        return f"""
+            SELECT
+                u.id AS id,
+                u.login AS login,
+                u.firstname AS firstname,
+                u.lastname AS lastname,
+                {mail_sql} AS mail
+            FROM {users_table} u
+            WHERE u.status = 1
+                AND u.login <> ''
+            ORDER BY u.login
+            {limit_sql}
+            """
+
+    def _query_active_users(self, limit_sql: str) -> List[Dict[str, Any]]:
+        try:
+            return self._query(
+                self._active_users_sql(limit_sql, email_table=True, mail_column=True)
+            )
+        except RedmineReadOnlyError as error:
+            if error.code == "redmine_table_missing":
+                # Redmine older than 3.0: no email_addresses table at all.
+                return self._query(
+                    self._active_users_sql(
+                        limit_sql, email_table=False, mail_column=True
+                    )
+                )
+            if error.code == "redmine_schema_mismatch":
+                # Redmine 3.0+ that dropped users.mail during the migration.
+                return self._query(
+                    self._active_users_sql(
+                        limit_sql, email_table=True, mail_column=False
+                    )
+                )
+            raise
 
     def time_by_project(
         self,

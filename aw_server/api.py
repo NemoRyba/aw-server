@@ -1369,53 +1369,66 @@ class ServerAPI:
             },
             "days": [],
         }
+        if not selected_usernames:
+            if not config.get("enabled"):
+                payload["message"] = "Redmine integration is disabled"
+            return payload
+
+        # The Redmine half is optional. When it is disabled or unreachable the
+        # days are still returned, carrying their tracked time with no bookings
+        # (exactly like a user without a Redmine account) - "how long did I work
+        # that day" does not depend on Redmine, and the personal summary page is
+        # built around that list. The message/error stays in the payload so the
+        # UI can say why the booked column is empty.
+        matched_by_username = {}
+        entry_rows = []
         if not config.get("enabled"):
             payload["message"] = "Redmine integration is disabled"
-            return payload
-        if not selected_usernames:
-            return payload
+        else:
+            spent_from, spent_to = redmine_spent_on_range(start, end)
+            profiles = {
+                username: self.settings.lookup_ldap_user_profile(username)
+                for username in selected_usernames
+            }
 
-        spent_from, spent_to = redmine_spent_on_range(start, end)
-        profiles = {
-            username: self.settings.lookup_ldap_user_profile(username)
-            for username in selected_usernames
-        }
-
-        try:
-            source = RedmineReadOnlySource(config)
-            redmine_users = source.active_users()
-            redmine_users_by_email, redmine_users_by_id = self._redmine_user_indexes(
-                redmine_users
-            )
-            mappings = self.settings.get_redmine_user_mappings()
-
-            matched_by_username = {}
-            for username, profile in profiles.items():
-                match = self._redmine_match_for_profile(
-                    username=username,
-                    profile=profile,
-                    mappings=mappings,
-                    redmine_users_by_email=redmine_users_by_email,
-                    redmine_users_by_id=redmine_users_by_id,
+            try:
+                source = RedmineReadOnlySource(config)
+                redmine_users = source.active_users()
+                redmine_users_by_email, redmine_users_by_id = self._redmine_user_indexes(
+                    redmine_users
                 )
-                if match.get("matched"):
-                    matched_by_username[username] = match["redmine_user"]
+                mappings = self.settings.get_redmine_user_mappings()
 
-            entry_rows = source.daily_time_entries(
-                user_ids=[user["id"] for user in matched_by_username.values()],
-                spent_from=spent_from,
-                spent_to=spent_to,
-            )
-        except Exception as error:
-            readable_error = describe_redmine_error(error, config)
-            if isinstance(error, RedmineReadOnlyError):
-                logger.warning("Redmine daily comparison failed: %s", readable_error)
-            else:
-                logger.exception("Redmine daily comparison failed: %s", readable_error)
-            payload["error"] = str(readable_error)
-            payload["error_code"] = readable_error.code
-            payload["error_detail"] = readable_error.detail
-            return payload
+                for username, profile in profiles.items():
+                    match = self._redmine_match_for_profile(
+                        username=username,
+                        profile=profile,
+                        mappings=mappings,
+                        redmine_users_by_email=redmine_users_by_email,
+                        redmine_users_by_id=redmine_users_by_id,
+                    )
+                    if match.get("matched"):
+                        matched_by_username[username] = match["redmine_user"]
+
+                entry_rows = source.daily_time_entries(
+                    user_ids=[user["id"] for user in matched_by_username.values()],
+                    spent_from=spent_from,
+                    spent_to=spent_to,
+                )
+            except Exception as error:
+                readable_error = describe_redmine_error(error, config)
+                if isinstance(error, RedmineReadOnlyError):
+                    logger.warning("Redmine daily comparison failed: %s", readable_error)
+                else:
+                    logger.exception(
+                        "Redmine daily comparison failed: %s", readable_error
+                    )
+                payload["error"] = str(readable_error)
+                payload["error_code"] = readable_error.code
+                payload["error_detail"] = readable_error.detail
+                # A failed lookup must not look like "matched, booked nothing".
+                matched_by_username = {}
+                entry_rows = []
 
         username_by_user_id = {
             int(user["id"]): username for username, user in matched_by_username.items()
